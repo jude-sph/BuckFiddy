@@ -42,6 +42,29 @@ class DashboardLogHandler(logging.Handler):
             pass
 
 
+def _prefill_log_buffer():
+    """Load recent lines from the log file into LOG_BUFFER on startup."""
+    global _log_counter
+    try:
+        import os
+        log_path = os.path.join("data", "buckfiddy.log")
+        if os.path.exists(log_path):
+            with open(log_path, "r") as f:
+                lines = f.readlines()
+            # Take the last 500 lines (matching buffer size)
+            recent = lines[-500:] if len(lines) > 500 else lines
+            for line in recent:
+                stripped = line.rstrip("\n")
+                if stripped:
+                    _log_counter += 1
+                    LOG_BUFFER.append(stripped)
+    except Exception:
+        pass
+
+
+_prefill_log_buffer()
+
+
 def get_store() -> StateStore:
     global store
     if store is None:
@@ -270,6 +293,7 @@ def api_estimates():
     )
     return [
         {
+            "id": r["id"],
             "market_question": r["market_question"] if "market_question" in r.keys() else "",
             "outcome": r["outcome"],
             "claude_estimate": r["claude_estimate"],
@@ -592,6 +616,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let equityChart, costChart, estimatesChart;
 let logCursor = 0;
+// Track expanded rows so refreshes don't collapse them
+const expandedTrades = new Set();
+const expandedEstimates = new Set();
 
 function fmtUsd(v) { return '$' + Number(v).toFixed(2); }
 function fmtPct(v) { return (v >= 0 ? '+' : '') + Number(v).toFixed(1) + '%'; }
@@ -602,6 +629,17 @@ function fmtTime(iso) {
          d.toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit'});
 }
 function pnlClass(v) { return v > 0 ? 'stat-up' : v < 0 ? 'stat-down' : 'stat-neutral'; }
+
+function toggleTrade(id) {
+  if (expandedTrades.has(id)) expandedTrades.delete(id); else expandedTrades.add(id);
+  const el = document.getElementById('trade-detail-' + id);
+  if (el) el.classList.toggle('hidden');
+}
+function toggleEstimate(id) {
+  if (expandedEstimates.has(id)) expandedEstimates.delete(id); else expandedEstimates.add(id);
+  const el = document.getElementById('est-detail-' + id);
+  if (el) el.classList.toggle('hidden');
+}
 
 async function fetchJson(url) {
   const r = await fetch(url);
@@ -804,7 +842,10 @@ async function updateTrades() {
       <th class="text-right pb-2">Edge</th>
       <th class="text-right pb-2">P&L</th>
     </tr></thead>
-    <tbody>${data.map(t => `<tr class="border-t border-slate-800 ${t.reasoning ? 'cursor-pointer' : ''}" ${t.reasoning ? 'onclick="this.nextElementSibling.classList.toggle(\'hidden\')"' : ''}>
+    <tbody>${data.map(t => {
+      const id = t.trade_id;
+      const expanded = expandedTrades.has(id);
+      return `<tr class="border-t border-slate-800 ${t.reasoning ? 'cursor-pointer' : ''}" ${t.reasoning ? 'onclick="toggleTrade(\\''+id+'\\')"' : ''}>
       <td class="py-2 text-slate-400">${fmtTime(t.executed_at)}</td>
       <td class="max-w-[250px] truncate" title="${(t.market_question || '').replace(/"/g, '&quot;')}">${t.market_question || t.outcome}</td>
       <td><span class="px-2 py-0.5 rounded text-xs font-medium ${t.side === 'BUY' ? 'badge-buy' : 'badge-sell'}">${t.side} ${t.outcome}</span></td>
@@ -813,7 +854,8 @@ async function updateTrades() {
       <td class="text-right font-mono ${t.edge ? pnlClass(t.edge) : 'text-slate-600'}">${t.edge ? (t.edge * 100).toFixed(1) + '%' : '-'}</td>
       <td class="text-right font-mono ${t.pnl !== null ? pnlClass(t.pnl) : 'text-slate-600'}">${t.pnl !== null ? '$' + t.pnl.toFixed(2) : '-'}</td>
     </tr>
-    ${t.reasoning ? '<tr class="hidden border-t border-slate-800/50"><td colspan="7" class="py-3 px-4"><div class="text-xs text-slate-400 whitespace-pre-wrap bg-slate-900/50 rounded-lg p-3"><span class="text-slate-500 font-semibold">Claude\\'s estimate:</span> ' + (t.claude_estimate * 100).toFixed(1) + '% vs market ' + (t.market_midpoint * 100).toFixed(1) + '%<br><br>' + t.reasoning + '</div></td></tr>' : ''}`).join('')}</tbody></table>`;
+    ${t.reasoning ? '<tr id="trade-detail-'+id+'" class="'+(expanded ? '' : 'hidden ')+' border-t border-slate-800/50"><td colspan="7" class="py-3 px-4"><div class="text-xs text-slate-400 whitespace-pre-wrap bg-slate-900/50 rounded-lg p-3"><span class="text-slate-500 font-semibold">Claude\\'s estimate:</span> ' + (t.claude_estimate * 100).toFixed(1) + '% vs market ' + (t.market_midpoint * 100).toFixed(1) + '%<br><br>' + t.reasoning + '</div></td></tr>' : ''}`;
+    }).join('')}</tbody></table>`;
 }
 
 async function updateEstimatesTable() {
@@ -831,7 +873,10 @@ async function updateEstimatesTable() {
       <th class="text-right pb-2">Edge</th>
       <th class="text-center pb-2">Trade?</th>
     </tr></thead>
-    <tbody>${data.map((e, i) => `<tr class="border-t border-slate-800 cursor-pointer" onclick="this.nextElementSibling.classList.toggle('hidden')">
+    <tbody>${data.map((e, i) => {
+      const id = '' + (e.id || i);
+      const expanded = expandedEstimates.has(id);
+      return `<tr class="border-t border-slate-800 cursor-pointer" onclick="toggleEstimate('${id}')">
       <td class="py-2 text-slate-400">${fmtTime(e.created_at)}</td>
       <td class="max-w-[350px] truncate" title="${(e.market_question || '').replace(/"/g, '&quot;')}">${e.market_question || '<span class=\\'text-slate-600\\'>—</span>'}</td>
       <td><span class="px-2 py-0.5 rounded text-xs font-medium badge-yes">${e.outcome}</span></td>
@@ -840,11 +885,12 @@ async function updateEstimatesTable() {
       <td class="text-right font-mono ${pnlClass(e.edge)}">${(e.edge * 100).toFixed(1)}%</td>
       <td class="text-center">${e.tradeable ? '<span class="text-green-400 font-bold">YES</span>' : '<span class="text-slate-600">no</span>'}</td>
     </tr>
-    <tr class="hidden border-t border-slate-800/50">
+    <tr id="est-detail-${id}" class="${expanded ? '' : 'hidden'} border-t border-slate-800/50">
       <td colspan="7" class="py-3 px-4">
         <div class="text-xs text-slate-400 whitespace-pre-wrap bg-slate-900/50 rounded-lg p-3">${e.reasoning}</div>
       </td>
-    </tr>`).join('')}</tbody></table>`;
+    </tr>`;
+    }).join('')}</tbody></table>`;
 }
 
 async function updateCycles() {
@@ -923,15 +969,22 @@ async function refreshAll() {
   ]);
 }
 
+let logAutoScroll = true;
+// Detect when user manually scrolls up in the log window
+document.addEventListener('DOMContentLoaded', () => {
+  const el = $('log-output');
+  if (el) el.addEventListener('scroll', () => {
+    logAutoScroll = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  });
+});
+
 async function updateLogs() {
   const d = await fetchJson('/api/logs?after=' + logCursor);
   if (!d || !d.lines || d.lines.length === 0) return;
   const el = $('log-output');
-  const wasAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
   el.textContent += (el.textContent ? '\\n' : '') + d.lines.join('\\n');
   logCursor = d.cursor;
-  // Auto-scroll if user was near bottom
-  if (wasAtBottom) el.scrollTop = el.scrollHeight;
+  if (logAutoScroll) el.scrollTop = el.scrollHeight;
 }
 
 refreshAll();
