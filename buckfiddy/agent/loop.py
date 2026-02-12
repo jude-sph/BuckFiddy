@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -71,31 +72,50 @@ class AgentLoop:
         self.system_prompt = build_system_prompt(settings)
         self.store = StateStore(settings.DB_PATH)
         self.cycle_count = 0
+        self._stop_event = threading.Event()
+        self.running = False
+
+    def request_stop(self):
+        """Signal the agent loop to stop after the current cycle."""
+        self._stop_event.set()
 
     def run(self):
-        """Main loop — runs indefinitely."""
+        """Main loop — runs indefinitely until stopped."""
         logger.info("BuckFiddy agent loop starting")
-        while True:
-            try:
-                self._run_cycle()
-            except KeyboardInterrupt:
-                logger.info("Shutting down gracefully")
-                break
-            except Exception as e:
-                logger.error(f"Cycle {self.cycle_count} failed: {e}", exc_info=True)
+        self.running = True
+        self._stop_event.clear()
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    self._run_cycle()
+                except KeyboardInterrupt:
+                    logger.info("Shutting down gracefully")
+                    break
+                except Exception as e:
+                    logger.error(f"Cycle {self.cycle_count} failed: {e}", exc_info=True)
 
-            logger.info(
-                f"Sleeping {self.settings.SCAN_INTERVAL_SECONDS}s until next cycle..."
-            )
-            try:
-                time.sleep(self.settings.SCAN_INTERVAL_SECONDS)
-            except KeyboardInterrupt:
-                logger.info("Shutting down gracefully")
-                break
+                if self._stop_event.is_set():
+                    break
+
+                logger.info(
+                    f"Sleeping {self.settings.SCAN_INTERVAL_SECONDS}s until next cycle..."
+                )
+                # Sleep in small increments so stop is responsive
+                for _ in range(self.settings.SCAN_INTERVAL_SECONDS):
+                    if self._stop_event.is_set():
+                        break
+                    time.sleep(1)
+        finally:
+            self.running = False
+            logger.info("Agent loop stopped")
 
     def run_single_cycle(self):
         """Run exactly one cycle — useful for testing."""
-        self._run_cycle()
+        self.running = True
+        try:
+            self._run_cycle()
+        finally:
+            self.running = False
 
     def _run_cycle(self):
         self.cycle_count += 1
@@ -117,10 +137,12 @@ class AgentLoop:
         messages = [{"role": "user", "content": user_message}]
         usage = CycleUsage()
 
-        summary = self._run_agent_turn(messages, usage)
-
-        # Phase 4: Log cycle results and API costs
-        self._log_cycle(summary, len(stop_loss_results), usage)
+        summary = ""
+        try:
+            summary = self._run_agent_turn(messages, usage)
+        finally:
+            # Phase 4: Log cycle results and API costs (even if cycle was interrupted)
+            self._log_cycle(summary, len(stop_loss_results), usage)
 
     def _run_agent_turn(self, messages: list, usage: CycleUsage) -> str:
         """Run Claude with tool use until it stops calling tools."""
@@ -135,8 +157,9 @@ class AgentLoop:
             if response is None:
                 break
 
-            # Track API usage
+            # Track API usage and flush to DB immediately
             usage.record(response)
+            self._flush_usage(usage)
 
             # Append assistant response to messages
             messages.append({"role": "assistant", "content": response.content})
@@ -209,15 +232,16 @@ class AgentLoop:
             "your current financial position."
         ]
 
-        # Review positions every other cycle
-        if self.cycle_count % 2 == 0:
-            parts.append(
-                "\nAfter checking your wallet, review each of your open positions. "
-                "For each position, use review_position to get market details, then "
-                "research the topic with web_search, then submit a fresh probability "
-                "estimate. If your new estimate suggests the position no longer has "
-                "edge, close it."
-            )
+        # Review positions every cycle
+        parts.append(
+            "\nAfter checking your wallet, review ALL of your open positions. "
+            "For each position: call review_position, then submit_probability_estimate "
+            "with a fresh estimate based on your current knowledge. You do NOT need "
+            "to web_search for every position — use your existing knowledge for "
+            "quick re-estimates. Save web searches for new markets or positions you "
+            "are genuinely uncertain about. "
+            "If the system says ACTION REQUIRED to close, CLOSE THE POSITION IMMEDIATELY."
+        )
 
         parts.append(
             "\nThen scan for new market opportunities. For each interesting market, "
@@ -232,17 +256,70 @@ class AgentLoop:
 
         return "\n".join(parts)
 
+    def _flush_usage(self, usage: CycleUsage):
+        """Write current API usage to DB mid-cycle so the dashboard updates live."""
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            cost = usage.calculate_cost(self.settings.CLAUDE_MODEL)
+
+            # Upsert: update if this cycle already has a row, insert otherwise
+            existing = self.store.fetchone(
+                "SELECT id FROM api_usage WHERE cycle_number = ?",
+                (self.cycle_count,),
+            )
+            if existing:
+                self.store.execute(
+                    "UPDATE api_usage SET api_calls=?, input_tokens=?, "
+                    "output_tokens=?, cache_creation_tokens=?, cache_read_tokens=?, "
+                    "web_searches=?, cost_usd=?, created_at=? WHERE cycle_number=?",
+                    (
+                        usage.api_calls,
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cache_creation_tokens,
+                        usage.cache_read_tokens,
+                        usage.web_searches,
+                        round(cost, 6),
+                        now,
+                        self.cycle_count,
+                    ),
+                )
+            else:
+                self.store.execute(
+                    "INSERT INTO api_usage (cycle_number, api_calls, input_tokens, "
+                    "output_tokens, cache_creation_tokens, cache_read_tokens, "
+                    "web_searches, cost_usd, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        self.cycle_count,
+                        usage.api_calls,
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cache_creation_tokens,
+                        usage.cache_read_tokens,
+                        usage.web_searches,
+                        round(cost, 6),
+                        now,
+                    ),
+                )
+            self.store.commit()
+        except Exception as e:
+            logger.error(f"Failed to flush usage: {e}")
+
     def _log_cycle(self, summary: str, stop_losses: int, usage: CycleUsage):
         try:
             wallet = self.backend.get_wallet_state()
             now = datetime.now(timezone.utc).isoformat()
             cost = usage.calculate_cost(self.settings.CLAUDE_MODEL)
 
+            # Final flush of API usage (updates existing row from _flush_usage)
+            self._flush_usage(usage)
+
             # Cumulative API cost
             row = self.store.fetchone(
                 "SELECT COALESCE(SUM(cost_usd), 0) as total FROM api_usage"
             )
-            cumulative_cost = (row["total"] if row else 0) + cost
+            cumulative_cost = row["total"] if row else 0
 
             # Log cycle
             self.store.execute(
@@ -255,25 +332,6 @@ class AgentLoop:
                     wallet.balance,
                     wallet.total_equity,
                     summary[:2000] if summary else None,
-                    now,
-                ),
-            )
-
-            # Log API usage
-            self.store.execute(
-                "INSERT INTO api_usage (cycle_number, api_calls, input_tokens, "
-                "output_tokens, cache_creation_tokens, cache_read_tokens, "
-                "web_searches, cost_usd, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    self.cycle_count,
-                    usage.api_calls,
-                    usage.input_tokens,
-                    usage.output_tokens,
-                    usage.cache_creation_tokens,
-                    usage.cache_read_tokens,
-                    usage.web_searches,
-                    round(cost, 6),
                     now,
                 ),
             )

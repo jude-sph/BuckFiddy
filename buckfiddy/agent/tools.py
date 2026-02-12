@@ -301,6 +301,10 @@ class ToolDispatcher:
         real_price: MarketPrice = self.backend.get_market_price(token_id)
         midpoint = real_price.midpoint
 
+        # Get the market question from token metadata
+        meta = self.backend._get_token_meta(token_id) if hasattr(self.backend, '_get_token_meta') else {}
+        market_question = meta.get("market_question", "")
+
         # Calculate edge
         edge = estimate - midpoint
         abs_edge = abs(edge)
@@ -309,13 +313,14 @@ class ToolDispatcher:
         # Log the estimate
         now = datetime.now(timezone.utc).isoformat()
         self.store.execute(
-            "INSERT INTO estimates (market_id, token_id, outcome, claude_estimate, "
-            "market_midpoint, edge, reasoning, tradeable, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO estimates (market_id, token_id, outcome, market_question, "
+            "claude_estimate, market_midpoint, edge, reasoning, tradeable, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 market_id,
                 token_id,
                 outcome,
+                market_question,
                 estimate,
                 midpoint,
                 edge,
@@ -331,26 +336,84 @@ class ToolDispatcher:
             f"(edge: {edge:+.3f}, tradeable: {tradeable})"
         )
 
-        if tradeable and edge > 0:
+        # Check if Claude already holds a position in this market
+        wallet = self.backend.get_wallet_state()
+        balance = wallet.balance
+        held_position = next(
+            (p for p in wallet.positions if p.token_id == token_id),
+            None,
+        )
+        # Also check if holding the opposite side of this market
+        held_opposite = next(
+            (p for p in wallet.positions if p.market_id == market_id and p.token_id != token_id),
+            None,
+        )
+
+        # Calculate suggested position size
+        suggested_pct = min(
+            0.05 + (abs_edge - self.settings.EDGE_THRESHOLD) * 0.5,
+            self.settings.MAX_POSITION_PCT,
+        ) if tradeable else 0
+        suggested_amount = round(balance * suggested_pct, 2)
+
+        if held_position and not tradeable:
+            # Claude holds this outcome and edge has evaporated — CLOSE IT
             recommendation = (
-                f"EDGE FOUND: BUY {outcome} — you estimate {estimate:.3f}, "
-                f"market is at {midpoint:.3f}. Edge: +{abs_edge:.1%}. "
-                f"The market undervalues this outcome."
+                f"ACTION REQUIRED — CLOSE POSITION NOW. You hold "
+                f"{held_position.size:.1f} shares of {outcome} but edge has "
+                f"evaporated (your estimate {estimate:.3f} vs market "
+                f"{midpoint:.3f}, edge only {abs_edge:.1%}). "
+                f"Call close_position with position_id="
+                f"{held_position.position_id} to take profit/cut loss."
+            )
+        elif held_position and tradeable and edge < 0:
+            # Claude holds this outcome but now thinks it's OVERVALUED — CLOSE IT
+            recommendation = (
+                f"ACTION REQUIRED — CLOSE POSITION NOW. You hold "
+                f"{held_position.size:.1f} shares of {outcome} but your new "
+                f"estimate ({estimate:.3f}) is BELOW market ({midpoint:.3f}). "
+                f"The edge has FLIPPED against you. "
+                f"Call close_position with position_id="
+                f"{held_position.position_id} immediately."
+            )
+        elif held_opposite and tradeable and edge > 0:
+            # Claude holds the opposite side but now thinks THIS side is undervalued
+            recommendation = (
+                f"WARNING: You hold the OPPOSITE outcome ({held_opposite.outcome}) "
+                f"but now estimate {outcome} at {estimate:.3f} vs market "
+                f"{midpoint:.3f}. Consider closing position "
+                f"{held_opposite.position_id} if edge has flipped."
+            )
+        elif tradeable and edge > 0:
+            recommendation = (
+                f"ACTION REQUIRED — PLACE TRADE NOW. BUY {outcome} shares. "
+                f"You estimate {estimate:.3f}, market is at {midpoint:.3f}. "
+                f"Edge: +{abs_edge:.1%}. "
+                f"Suggested: place_market_order with token_id={token_id}, "
+                f"side=BUY, amount=${suggested_amount:.2f} "
+                f"({suggested_pct:.0%} of ${balance:.2f} balance). "
+                f"Do this BEFORE analyzing other markets."
             )
         elif tradeable and edge < 0:
             recommendation = (
-                f"EDGE FOUND: The market overvalues {outcome} — you estimate "
-                f"{estimate:.3f}, market is at {midpoint:.3f}. Edge: {edge:+.3f}. "
-                f"Consider buying the opposite outcome or selling if you hold this."
+                f"ACTION REQUIRED — PLACE TRADE NOW. The market OVERVALUES "
+                f"{outcome} at {midpoint:.3f} vs your {estimate:.3f}. "
+                f"Edge: {abs_edge:.1%}. You should BUY the OPPOSITE outcome. "
+                f"Look up the other token_id from scan_markets results for this "
+                f"market and call place_market_order with side=BUY, "
+                f"amount=${suggested_amount:.2f} "
+                f"({suggested_pct:.0%} of ${balance:.2f} balance). "
+                f"Do this BEFORE analyzing other markets."
             )
         else:
             recommendation = (
                 f"No tradeable edge — your estimate {estimate:.3f} is close to "
                 f"market {midpoint:.3f}. Edge: {abs_edge:.1%} "
-                f"(below {self.settings.EDGE_THRESHOLD:.0%} threshold)."
+                f"(below {self.settings.EDGE_THRESHOLD:.0%} threshold). "
+                f"Move on to the next market."
             )
 
-        return {
+        result = {
             "your_estimate": estimate,
             "market_midpoint": midpoint,
             "best_bid": real_price.best_bid,
@@ -360,6 +423,13 @@ class ToolDispatcher:
             "tradeable": tradeable,
             "recommendation": recommendation,
         }
+        if held_position:
+            result["you_hold"] = {
+                "position_id": held_position.position_id,
+                "shares": held_position.size,
+                "outcome": held_position.outcome,
+            }
+        return result
 
     def _handle_place_limit_order(self, input: dict) -> dict:
         result = self.backend.place_limit_order(

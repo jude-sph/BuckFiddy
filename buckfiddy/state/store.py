@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS estimates (
     market_id TEXT NOT NULL,
     token_id TEXT NOT NULL,
     outcome TEXT NOT NULL,
+    market_question TEXT NOT NULL DEFAULT '',
     claude_estimate REAL NOT NULL,
     market_midpoint REAL NOT NULL,
     edge REAL NOT NULL,
@@ -98,9 +99,9 @@ CREATE TABLE IF NOT EXISTS equity_snapshots (
 
 
 class StateStore:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, check_same_thread: bool = True):
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-        self.conn = sqlite3.connect(db_path)
+        self.conn = sqlite3.connect(db_path, check_same_thread=check_same_thread)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self._init_schema()

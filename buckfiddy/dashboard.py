@@ -4,25 +4,63 @@ Run:  python -m buckfiddy.dashboard
 Then open http://localhost:8050
 """
 
+import collections
+import logging
 import sys
+import threading
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
+from buckfiddy.agent.loop import AgentLoop
 from buckfiddy.config import Settings
+from buckfiddy.markets.scanner import MarketScanner
 from buckfiddy.state.store import StateStore
+from buckfiddy.trading.mock import MockTradingBackend
 
 app = FastAPI(title="BuckFiddy Dashboard")
 store: StateStore | None = None
+agent: AgentLoop | None = None
+agent_thread: threading.Thread | None = None
+
+# ── Log capture ────────────────────────────────────────────
+LOG_BUFFER: collections.deque[str] = collections.deque(maxlen=500)
+_log_counter = 0
+
+
+class DashboardLogHandler(logging.Handler):
+    """Captures log records into an in-memory ring buffer for the dashboard."""
+    def emit(self, record):
+        global _log_counter
+        try:
+            msg = self.format(record)
+            _log_counter += 1
+            LOG_BUFFER.append(msg)
+        except Exception:
+            pass
 
 
 def get_store() -> StateStore:
     global store
     if store is None:
         settings = Settings()
-        store = StateStore(settings.DB_PATH)
+        store = StateStore(settings.DB_PATH, check_same_thread=False)
     return store
+
+
+def get_or_create_agent() -> AgentLoop:
+    global agent
+    if agent is None:
+        settings = Settings()
+        if settings.TRADING_BACKEND == "mock":
+            backend = MockTradingBackend(settings)
+        else:
+            from buckfiddy.trading.real import RealTradingBackend
+            backend = RealTradingBackend(settings)
+        scanner = MarketScanner(settings)
+        agent = AgentLoop(backend, scanner, settings)
+    return agent
 
 
 # ── API Routes ──────────────────────────────────────────────
@@ -45,7 +83,13 @@ def api_summary():
     equity = latest_snap["equity"] if latest_snap else balance
     pos_value = latest_snap["position_value"] if latest_snap else 0
     num_pos = latest_snap["num_positions"] if latest_snap else 0
-    api_cost = latest_snap["cumulative_api_cost"] if latest_snap else 0
+    # Read live API cost from api_usage (updated mid-cycle), fall back to snapshot
+    live_cost = s.fetchone(
+        "SELECT COALESCE(SUM(cost_usd), 0) as total FROM api_usage"
+    )
+    api_cost = live_cost["total"] if live_cost and live_cost["total"] else (
+        latest_snap["cumulative_api_cost"] if latest_snap else 0
+    )
 
     pnl = equity - starting
     pnl_pct = (pnl / starting * 100) if starting else 0
@@ -147,12 +191,13 @@ def api_estimates():
     )
     return [
         {
+            "market_question": r["market_question"] if "market_question" in r.keys() else "",
             "outcome": r["outcome"],
             "claude_estimate": r["claude_estimate"],
             "market_midpoint": r["market_midpoint"],
             "edge": r["edge"],
             "tradeable": bool(r["tradeable"]),
-            "reasoning": r["reasoning"][:200],
+            "reasoning": r["reasoning"],
             "created_at": r["created_at"],
         }
         for r in rows
@@ -196,6 +241,69 @@ def api_cycles():
     ]
 
 
+@app.post("/api/reset")
+def api_reset():
+    if agent and agent.running:
+        return JSONResponse({"error": "Stop the agent before resetting"}, status_code=400)
+    s = get_store()
+    for table in ["estimates", "trades", "orders", "positions", "cycle_log", "api_usage", "equity_snapshots"]:
+        s.execute(f"DELETE FROM {table}")
+    s.execute("UPDATE wallet SET balance = 100.0 WHERE id = 1")
+    s.commit()
+    return {"status": "ok", "message": "All data cleared, balance reset to $100"}
+
+
+@app.get("/api/agent/status")
+def api_agent_status():
+    running = agent is not None and agent.running
+    return {
+        "running": running,
+        "cycle": agent.cycle_count if agent else 0,
+    }
+
+
+@app.post("/api/agent/start")
+def api_agent_start():
+    global agent_thread
+    a = get_or_create_agent()
+    if a.running:
+        return {"status": "already_running", "cycle": a.cycle_count}
+    agent_thread = threading.Thread(target=a.run, daemon=True, name="buckfiddy-agent")
+    agent_thread.start()
+    return {"status": "started"}
+
+
+@app.post("/api/agent/stop")
+def api_agent_stop():
+    if agent is None or not agent.running:
+        return {"status": "not_running"}
+    agent.request_stop()
+    return {"status": "stopping", "message": "Agent will stop after current cycle completes"}
+
+
+@app.post("/api/agent/single")
+def api_agent_single():
+    global agent_thread
+    a = get_or_create_agent()
+    if a.running:
+        return JSONResponse({"error": "Agent is already running"}, status_code=400)
+    agent_thread = threading.Thread(target=a.run_single_cycle, daemon=True, name="buckfiddy-single")
+    agent_thread.start()
+    return {"status": "started_single"}
+
+
+@app.get("/api/logs")
+def api_logs(after: int = 0):
+    """Return log lines. Client passes `after=N` to get only new lines."""
+    lines = list(LOG_BUFFER)
+    current = _log_counter
+    # If client has a cursor, only send new lines
+    if after > 0 and after < current:
+        new_count = current - after
+        lines = lines[-new_count:] if new_count < len(lines) else lines
+    return {"lines": lines, "cursor": current}
+
+
 # ── HTML Dashboard ──────────────────────────────────────────
 
 
@@ -237,6 +345,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <span id="status-dot" class="w-2 h-2 rounded-full bg-slate-600"></span>
       <span id="status-text" class="text-xs text-slate-500">Loading...</span>
       <span id="last-update" class="text-xs text-slate-600 ml-4"></span>
+      <div class="flex items-center gap-2 ml-4">
+        <button id="btn-start" onclick="agentStart()" class="px-3 py-1.5 text-xs font-medium text-green-400 border border-green-900 rounded-lg hover:bg-green-900/30 transition-colors">Start Agent</button>
+        <button id="btn-single" onclick="agentSingle()" class="px-3 py-1.5 text-xs font-medium text-blue-400 border border-blue-900 rounded-lg hover:bg-blue-900/30 transition-colors">Run 1 Cycle</button>
+        <button id="btn-stop" onclick="agentStop()" class="px-3 py-1.5 text-xs font-medium text-amber-400 border border-amber-900 rounded-lg hover:bg-amber-900/30 transition-colors hidden">Stop Agent</button>
+        <button onclick="resetData()" class="px-3 py-1.5 text-xs font-medium text-red-400 border border-red-900 rounded-lg hover:bg-red-900/30 transition-colors">Reset</button>
+      </div>
     </div>
   </div>
 
@@ -325,11 +439,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Terminal Log -->
+  <div class="card p-6 mb-6">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-sm font-semibold text-slate-400 uppercase tracking-wider">Terminal Output</h2>
+      <button onclick="$('log-output').textContent=''; logCursor=0;" class="text-xs text-slate-600 hover:text-slate-400 transition-colors">Clear</button>
+    </div>
+    <div id="log-output" class="bg-black/50 rounded-lg p-4 font-mono text-xs text-green-400 h-80 overflow-y-auto whitespace-pre-wrap leading-relaxed border border-slate-800"></div>
+  </div>
+
 </div>
 
 <script>
 const $ = id => document.getElementById(id);
 let equityChart, costChart, estimatesChart;
+let logCursor = 0;
 
 function fmtUsd(v) { return '$' + Number(v).toFixed(2); }
 function fmtPct(v) { return (v >= 0 ? '+' : '') + Number(v).toFixed(1) + '%'; }
@@ -364,10 +488,20 @@ async function updateSummary() {
   const closed = d.wins + d.losses;
   $('stat-winrate').textContent = closed > 0 ? Math.round(d.wins / closed * 100) + '%' : '-';
 
-  // Status indicator
-  $('status-dot').className = 'w-2 h-2 rounded-full ' + (d.cycles > 0 ? 'bg-green-500 pulse' : 'bg-slate-600');
-  $('status-text').textContent = d.cycles > 0 ? 'Cycle ' + d.cycles : 'Waiting...';
   $('last-update').textContent = 'Updated ' + new Date().toLocaleTimeString();
+}
+
+async function updateAgentStatus() {
+  const d = await fetchJson('/api/agent/status');
+  if (!d) return;
+  const running = d.running;
+  $('status-dot').className = 'w-2 h-2 rounded-full ' + (running ? 'bg-green-500 pulse' : 'bg-slate-600');
+  $('status-text').textContent = running ? 'Running — Cycle ' + d.cycle : 'Stopped';
+  $('btn-start').classList.toggle('hidden', running);
+  $('btn-single').classList.toggle('hidden', running);
+  $('btn-stop').classList.toggle('hidden', !running);
+  // Reset stop button state when agent has stopped
+  if (!running) { $('btn-stop').disabled = false; $('btn-stop').textContent = 'Stop Agent'; }
 }
 
 async function updateEquityChart() {
@@ -516,21 +650,26 @@ async function updateEstimatesTable() {
   el.innerHTML = `<table class="w-full text-sm">
     <thead><tr class="text-slate-500 text-xs uppercase">
       <th class="text-left pb-2">Time</th>
-      <th class="text-left pb-2">Outcome</th>
+      <th class="text-left pb-2">Market</th>
+      <th class="text-left pb-2">Side</th>
       <th class="text-right pb-2">Claude</th>
-      <th class="text-right pb-2">Market</th>
+      <th class="text-right pb-2">Price</th>
       <th class="text-right pb-2">Edge</th>
       <th class="text-center pb-2">Trade?</th>
-      <th class="text-left pb-2 pl-4">Reasoning</th>
     </tr></thead>
-    <tbody>${data.map(e => `<tr class="border-t border-slate-800">
+    <tbody>${data.map((e, i) => `<tr class="border-t border-slate-800 cursor-pointer" onclick="this.nextElementSibling.classList.toggle('hidden')">
       <td class="py-2 text-slate-400">${fmtTime(e.created_at)}</td>
-      <td>${e.outcome}</td>
+      <td class="max-w-[350px] truncate" title="${(e.market_question || '').replace(/"/g, '&quot;')}">${e.market_question || '<span class=\\'text-slate-600\\'>—</span>'}</td>
+      <td><span class="px-2 py-0.5 rounded text-xs font-medium badge-yes">${e.outcome}</span></td>
       <td class="text-right font-mono">${(e.claude_estimate * 100).toFixed(1)}%</td>
       <td class="text-right font-mono">${(e.market_midpoint * 100).toFixed(1)}%</td>
       <td class="text-right font-mono ${pnlClass(e.edge)}">${(e.edge * 100).toFixed(1)}%</td>
       <td class="text-center">${e.tradeable ? '<span class="text-green-400 font-bold">YES</span>' : '<span class="text-slate-600">no</span>'}</td>
-      <td class="text-slate-500 text-xs pl-4 max-w-[300px] truncate">${e.reasoning}</td>
+    </tr>
+    <tr class="hidden border-t border-slate-800/50">
+      <td colspan="7" class="py-3 px-4">
+        <div class="text-xs text-slate-400 whitespace-pre-wrap bg-slate-900/50 rounded-lg p-3">${e.reasoning}</div>
+      </td>
     </tr>`).join('')}</tbody></table>`;
 }
 
@@ -552,9 +691,39 @@ async function updateCycles() {
   `).join('');
 }
 
+async function agentStart() {
+  const r = await fetch('/api/agent/start', { method: 'POST' });
+  if (r.ok) updateAgentStatus();
+}
+
+async function agentStop() {
+  const r = await fetch('/api/agent/stop', { method: 'POST' });
+  if (r.ok) {
+    $('status-text').textContent = 'Stopping...';
+    $('btn-stop').disabled = true;
+    $('btn-stop').textContent = 'Stopping...';
+  }
+}
+
+async function agentSingle() {
+  const r = await fetch('/api/agent/single', { method: 'POST' });
+  if (r.ok) updateAgentStatus();
+}
+
+async function resetData() {
+  if (!confirm('Reset all data? This clears all trades, positions, estimates, and resets balance to $100.')) return;
+  const r = await fetch('/api/reset', { method: 'POST' });
+  if (r.ok) { refreshAll(); }
+  else {
+    const d = await r.json();
+    alert(d.error || 'Reset failed');
+  }
+}
+
 async function refreshAll() {
   await Promise.all([
     updateSummary(),
+    updateAgentStatus(),
     updateEquityChart(),
     updateCostChart(),
     updateEstimatesChart(),
@@ -565,8 +734,21 @@ async function refreshAll() {
   ]);
 }
 
+async function updateLogs() {
+  const d = await fetchJson('/api/logs?after=' + logCursor);
+  if (!d || !d.lines || d.lines.length === 0) return;
+  const el = $('log-output');
+  const wasAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  el.textContent += (el.textContent ? '\\n' : '') + d.lines.join('\\n');
+  logCursor = d.cursor;
+  // Auto-scroll if user was near bottom
+  if (wasAtBottom) el.scrollTop = el.scrollHeight;
+}
+
 refreshAll();
+updateLogs();
 setInterval(refreshAll, 15000);
+setInterval(updateLogs, 3000);
 </script>
 </body>
 </html>"""
@@ -578,7 +760,28 @@ def dashboard():
 
 
 def main():
+    # Set up logging so agent output goes to console + file + dashboard buffer
+    import os
+    os.makedirs("data", exist_ok=True)
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    dashboard_handler = DashboardLogHandler()
+    dashboard_handler.setFormatter(fmt)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler("data/buckfiddy.log"),
+            dashboard_handler,
+        ],
+    )
     print("BuckFiddy Dashboard starting at http://localhost:8050")
+    print("Use the Start/Stop buttons in the UI to control the agent")
     uvicorn.run(app, host="0.0.0.0", port=8050, log_level="warning")
 
 
