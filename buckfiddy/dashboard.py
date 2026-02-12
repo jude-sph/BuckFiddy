@@ -545,6 +545,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="card p-4">
       <div class="text-xs text-slate-500 uppercase tracking-wider">API Cost</div>
       <div id="stat-apicost" class="text-xl font-bold text-orange-400 mt-1">-</div>
+      <div class="mt-2 flex items-center gap-1">
+        <span class="text-xs text-slate-600">Limit $</span>
+        <input id="cost-limit" type="number" step="0.5" min="0" value="5" class="w-14 px-1 py-0.5 text-xs font-mono text-orange-300 bg-slate-800 border border-slate-700 rounded" onchange="saveCostLimit()">
+      </div>
     </div>
   </div>
 
@@ -620,6 +624,23 @@ let logCursor = 0;
 const expandedTrades = new Set();
 const expandedEstimates = new Set();
 
+// Cost limit (persisted in localStorage)
+let costLimitAlerted = false;
+function getCostLimit() {
+  const v = localStorage.getItem('bf_cost_limit');
+  return v ? parseFloat(v) : 5.0;
+}
+function saveCostLimit() {
+  const v = parseFloat($('cost-limit').value) || 0;
+  localStorage.setItem('bf_cost_limit', v);
+}
+// Restore on load
+(function() {
+  const saved = getCostLimit();
+  const el = document.getElementById('cost-limit');
+  if (el) el.value = saved;
+})();
+
 function fmtUsd(v) { return '$' + Number(v).toFixed(2); }
 function fmtPct(v) { return (v >= 0 ? '+' : '') + Number(v).toFixed(1) + '%'; }
 function fmtTime(iso) {
@@ -660,6 +681,25 @@ async function updateSummary() {
   $('stat-positions').textContent = d.num_positions;
   $('stat-trades').textContent = d.total_trades;
   $('stat-apicost').textContent = '$' + d.api_cost.toFixed(4);
+
+  // Check cost limit — auto-stop agent if exceeded
+  const costLimit = getCostLimit();
+  if (costLimit > 0 && d.api_cost >= costLimit) {
+    $('stat-apicost').className = 'text-xl font-bold text-red-500 mt-1';
+    if (!costLimitAlerted) {
+      costLimitAlerted = true;
+      fetch('/api/agent/status').then(r => r.json()).then(s => {
+        if (s.running) {
+          fetch('/api/agent/stop', { method: 'POST' });
+          alert('API cost limit ($' + costLimit.toFixed(2) + ') reached! Agent has been stopped.');
+          updateAgentStatus();
+        }
+      });
+    }
+  } else {
+    $('stat-apicost').className = 'text-xl font-bold text-orange-400 mt-1';
+    costLimitAlerted = false;
+  }
 
   const closed = d.wins + d.losses;
   $('stat-winrate').textContent = closed > 0 ? Math.round(d.wins / closed * 100) + '%' : '-';
