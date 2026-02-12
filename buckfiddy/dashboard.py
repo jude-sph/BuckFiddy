@@ -570,22 +570,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <canvas id="estimates-chart" height="120"></canvas>
   </div>
 
-  <!-- Tables Row -->
-  <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
-    <!-- Open Positions -->
-    <div class="card p-6">
-      <h2 class="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-4">Open Positions</h2>
-      <div id="positions-table" class="overflow-x-auto">
-        <p class="text-slate-600 text-sm">No positions</p>
-      </div>
+  <!-- Open Positions -->
+  <div class="card p-6 mb-6">
+    <h2 class="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-4">Open Positions</h2>
+    <div id="positions-table" class="overflow-x-auto">
+      <p class="text-slate-600 text-sm">No positions</p>
     </div>
+  </div>
 
-    <!-- Recent Trades -->
-    <div class="card p-6">
-      <h2 class="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-4">Recent Trades</h2>
-      <div id="trades-table" class="overflow-x-auto">
-        <p class="text-slate-600 text-sm">No trades yet</p>
-      </div>
+  <!-- Recent Trades -->
+  <div class="card p-6 mb-6">
+    <h2 class="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-4">Recent Trades</h2>
+    <div id="trades-table" class="overflow-x-auto">
+      <p class="text-slate-600 text-sm">No trades yet</p>
     </div>
   </div>
 

@@ -197,6 +197,10 @@ TOOLS = [
                     "type": "string",
                     "description": "The position ID to close",
                 },
+                "estimate_id": {
+                    "type": "integer",
+                    "description": "The estimate_id from submit_probability_estimate that triggered this close decision",
+                },
             },
             "required": ["position_id"],
         },
@@ -237,6 +241,7 @@ class ToolDispatcher:
         self.scanner = scanner
         self.settings = settings
         self.store = StateStore(settings.DB_PATH)
+        self._market_end_dates: dict[str, str] = {}  # market_id -> end_date
 
     def dispatch(self, tool_name: str, tool_input: dict) -> str:
         """Execute a tool and return the JSON result string."""
@@ -278,6 +283,8 @@ class ToolDispatcher:
                 self.backend.register_token_meta(
                     token_id, m.market_id, outcome, m.question
                 )
+                # Store end_date in our own metadata cache for position reviews
+                self._market_end_dates[m.market_id] = m.end_date
 
         # Return markets WITHOUT prices
         return {
@@ -365,25 +372,26 @@ class ToolDispatcher:
         ) if tradeable else 0
         suggested_amount = round(balance * suggested_pct, 2)
 
-        if held_position and not tradeable:
-            # Claude holds this outcome and edge has evaporated — CLOSE IT
-            recommendation = (
-                f"ACTION REQUIRED — CLOSE POSITION NOW. You hold "
-                f"{held_position.size:.1f} shares of {outcome} but edge has "
-                f"evaporated (your estimate {estimate:.3f} vs market "
-                f"{midpoint:.3f}, edge only {abs_edge:.1%}). "
-                f"Call close_position with position_id="
-                f"{held_position.position_id} to take profit/cut loss."
-            )
-        elif held_position and tradeable and edge < 0:
+        if held_position and tradeable and edge < 0:
             # Claude holds this outcome but now thinks it's OVERVALUED — CLOSE IT
             recommendation = (
                 f"ACTION REQUIRED — CLOSE POSITION NOW. You hold "
                 f"{held_position.size:.1f} shares of {outcome} but your new "
                 f"estimate ({estimate:.3f}) is BELOW market ({midpoint:.3f}). "
-                f"The edge has FLIPPED against you. "
+                f"The edge has FLIPPED against you ({edge:+.1%}). "
                 f"Call close_position with position_id="
-                f"{held_position.position_id} immediately."
+                f"{held_position.position_id} and estimate_id={estimate_id} immediately."
+            )
+        elif held_position and not tradeable:
+            # Edge has narrowed but not flipped — hold for long-horizon bets
+            recommendation = (
+                f"HOLD — edge has narrowed but position is still directionally "
+                f"correct. You hold {held_position.size:.1f} shares of {outcome}. "
+                f"Your estimate {estimate:.3f} vs market {midpoint:.3f} "
+                f"(edge: {edge:+.1%}, below {self.settings.EDGE_THRESHOLD:.0%} threshold). "
+                f"The market is moving towards your estimate, which is good. "
+                f"Only close if you believe the fundamental thesis has changed or "
+                f"if you want to take profit. No action required."
             )
         elif held_opposite and tradeable and edge > 0:
             # Claude holds the opposite side but now thinks THIS side is undervalued
@@ -469,7 +477,15 @@ class ToolDispatcher:
         return result.model_dump()
 
     def _handle_close_position(self, input: dict) -> dict:
+        estimate_id = input.get("estimate_id")
         result = self.backend.close_position(input["position_id"])
+        if result.success and estimate_id and result.order_id:
+            # Link the close trade to the estimate that triggered the decision
+            self.store.execute(
+                "UPDATE trades SET estimate_id = ? WHERE order_id = ? AND estimate_id IS NULL",
+                (estimate_id, result.order_id),
+            )
+            self.store.commit()
         return result.model_dump()
 
     def _handle_review_position(self, input: dict) -> dict:
@@ -483,6 +499,7 @@ class ToolDispatcher:
             return {"error": f"Position {input['position_id']} not found"}
 
         # Deliberately exclude: avg_entry_price, current_value, unrealized_pnl
+        end_date = self._market_end_dates.get(position.market_id, "unknown")
         return {
             "position_id": position.position_id,
             "market_id": position.market_id,
@@ -490,4 +507,5 @@ class ToolDispatcher:
             "market_question": position.market_question,
             "outcome": position.outcome,
             "shares_held": position.size,
+            "market_end_date": end_date,
         }

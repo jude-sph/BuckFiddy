@@ -240,12 +240,15 @@ class AgentLoop:
         # Review positions every cycle
         parts.append(
             "\nAfter checking your wallet, review ALL of your open positions. "
-            "For each position: call review_position, then submit_probability_estimate "
-            "with a fresh estimate based on your current knowledge. You do NOT need "
-            "to web_search for every position — use your existing knowledge for "
-            "quick re-estimates. Save web searches for new markets or positions you "
-            "are genuinely uncertain about. "
-            "If the system says ACTION REQUIRED to close, CLOSE THE POSITION IMMEDIATELY."
+            "For each position: call review_position (note the market end date), "
+            "then submit_probability_estimate with a fresh estimate based on your "
+            "current knowledge. You do NOT need to web_search for every position — "
+            "use your existing knowledge for quick re-estimates. Save web searches "
+            "for new markets or positions you are genuinely uncertain about.\n"
+            "IMPORTANT: If the system says ACTION REQUIRED (edge flipped), close "
+            "the position. If it says HOLD, leave it alone — do NOT close positions "
+            "just because edge narrowed slightly. For long-horizon markets, patience "
+            "is your edge."
         )
 
         parts.append(
