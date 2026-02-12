@@ -8,6 +8,7 @@ import collections
 import logging
 import sys
 import threading
+import time
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -63,35 +64,90 @@ def get_or_create_agent() -> AgentLoop:
     return agent
 
 
+# ── Live price updater ─────────────────────────────────────
+# Caches the latest wallet state (with live prices) so the dashboard
+# doesn't need the agent to be running to show current values.
+
+_live_state: dict = {}
+_live_state_lock = threading.Lock()
+_price_updater_started = False
+
+
+def _price_update_loop():
+    """Background thread: fetch live prices for open positions every 30s."""
+    while True:
+        try:
+            a = get_or_create_agent()
+            wallet = a.backend.get_wallet_state()
+            with _live_state_lock:
+                _live_state["cash"] = wallet.balance
+                _live_state["position_value"] = wallet.total_position_value
+                _live_state["total_value"] = wallet.total_equity
+                _live_state["num_positions"] = len(wallet.positions)
+                _live_state["positions"] = [
+                    {
+                        "position_id": p.position_id,
+                        "market_question": p.market_question,
+                        "outcome": p.outcome,
+                        "size": p.size,
+                        "avg_entry_price": p.avg_entry_price,
+                        "current_value": p.current_value,
+                        "unrealized_pnl": p.unrealized_pnl,
+                        "unrealized_pnl_pct": p.unrealized_pnl_pct,
+                    }
+                    for p in wallet.positions
+                ]
+        except Exception as e:
+            logging.getLogger("buckfiddy.price_updater").debug(f"Price update failed: {e}")
+        time.sleep(30)
+
+
+def _ensure_price_updater():
+    global _price_updater_started
+    if not _price_updater_started:
+        _price_updater_started = True
+        t = threading.Thread(target=_price_update_loop, daemon=True, name="price-updater")
+        t.start()
+
+
 # ── API Routes ──────────────────────────────────────────────
 
 
 @app.get("/api/summary")
 def api_summary():
+    _ensure_price_updater()
     s = get_store()
-    wallet = s.fetchone("SELECT balance FROM wallet WHERE id = 1")
-    balance = wallet["balance"] if wallet else 0
 
-    latest_snap = s.fetchone(
-        "SELECT * FROM equity_snapshots ORDER BY id DESC LIMIT 1"
-    )
+    # Use live state if available (updated every 30s with real prices)
+    with _live_state_lock:
+        live = dict(_live_state)
+
+    if live:
+        cash = live["cash"]
+        pos_value = live["position_value"]
+        total_value = live["total_value"]
+        num_pos = live["num_positions"]
+    else:
+        wallet = s.fetchone("SELECT balance FROM wallet WHERE id = 1")
+        cash = wallet["balance"] if wallet else 0
+        pos_value = 0
+        total_value = cash
+        num_pos = 0
+
+    starting = 100.0
     first_snap = s.fetchone(
         "SELECT equity FROM equity_snapshots ORDER BY id ASC LIMIT 1"
     )
+    if first_snap:
+        starting = first_snap["equity"]
 
-    starting = first_snap["equity"] if first_snap else 100.0
-    equity = latest_snap["equity"] if latest_snap else balance
-    pos_value = latest_snap["position_value"] if latest_snap else 0
-    num_pos = latest_snap["num_positions"] if latest_snap else 0
-    # Read live API cost from api_usage (updated mid-cycle), fall back to snapshot
+    # Read live API cost from api_usage (updated mid-cycle)
     live_cost = s.fetchone(
         "SELECT COALESCE(SUM(cost_usd), 0) as total FROM api_usage"
     )
-    api_cost = live_cost["total"] if live_cost and live_cost["total"] else (
-        latest_snap["cumulative_api_cost"] if latest_snap else 0
-    )
+    api_cost = live_cost["total"] if live_cost and live_cost["total"] else 0
 
-    pnl = equity - starting
+    pnl = total_value - starting
     pnl_pct = (pnl / starting * 100) if starting else 0
 
     cycles = s.fetchone("SELECT COUNT(*) as n FROM cycle_log")
@@ -110,19 +166,21 @@ def api_summary():
         "SELECT COUNT(*) as n FROM estimates WHERE tradeable = 1"
     )
 
+    settings = Settings()
+
     return {
-        "balance": round(balance, 2),
-        "equity": round(equity, 2),
+        "cash": round(cash, 2),
         "position_value": round(pos_value, 2),
+        "total_value": round(total_value, 2),
         "num_positions": num_pos,
-        "starting_equity": round(starting, 2),
+        "starting": round(starting, 2),
         "pnl": round(pnl, 2),
         "pnl_pct": round(pnl_pct, 1),
         "api_cost": round(api_cost, 4),
-        "net_pnl": round(pnl - api_cost, 4),
         "cycles": cycles["n"] if cycles else 0,
         "total_trades": total_trades["n"] if total_trades else 0,
         "wins": wins["n"] if wins else 0,
+        "backend": settings.TRADING_BACKEND,
         "losses": losses["n"] if losses else 0,
         "realized_pnl": round(realized["v"], 2) if realized else 0,
         "estimates": est_count["n"] if est_count else 0,
@@ -150,6 +208,14 @@ def api_equity():
 
 @app.get("/api/positions")
 def api_positions():
+    # Use live state (with real-time prices) if available
+    with _live_state_lock:
+        live_positions = _live_state.get("positions")
+
+    if live_positions:
+        return live_positions
+
+    # Fallback: read from DB (no live P&L)
     s = get_store()
     rows = s.fetchall("SELECT * FROM positions WHERE size > 0")
     return [
@@ -159,7 +225,9 @@ def api_positions():
             "outcome": r["outcome"],
             "size": r["size"],
             "avg_entry_price": r["avg_entry_price"],
-            "created_at": r["created_at"],
+            "current_value": round(r["size"] * r["avg_entry_price"], 4),
+            "unrealized_pnl": 0,
+            "unrealized_pnl_pct": 0,
         }
         for r in rows
     ]
@@ -168,7 +236,12 @@ def api_positions():
 @app.get("/api/trades")
 def api_trades():
     s = get_store()
-    rows = s.fetchall("SELECT * FROM trades ORDER BY executed_at DESC LIMIT 50")
+    rows = s.fetchall(
+        "SELECT t.*, e.claude_estimate, e.market_midpoint, e.edge, "
+        "e.reasoning AS estimate_reasoning, e.market_question "
+        "FROM trades t LEFT JOIN estimates e ON t.estimate_id = e.id "
+        "ORDER BY t.executed_at DESC LIMIT 50"
+    )
     return [
         {
             "trade_id": r["trade_id"],
@@ -177,6 +250,12 @@ def api_trades():
             "price": r["price"],
             "size": r["size"],
             "pnl": r["pnl"],
+            "estimate_id": r["estimate_id"],
+            "claude_estimate": r["claude_estimate"],
+            "market_midpoint": r["market_midpoint"],
+            "edge": r["edge"],
+            "reasoning": r["estimate_reasoning"],
+            "market_question": r["market_question"],
             "executed_at": r["executed_at"],
         }
         for r in rows
@@ -256,20 +335,65 @@ def api_reset():
 @app.get("/api/agent/status")
 def api_agent_status():
     running = agent is not None and agent.running
+    settings = Settings()
     return {
         "running": running,
         "cycle": agent.cycle_count if agent else 0,
+        "backend": settings.TRADING_BACKEND,
     }
+
+
+@app.post("/api/backend/switch")
+def api_backend_switch(body: dict):
+    global agent, agent_thread
+    target = body.get("backend", "").lower()
+    if target not in ("mock", "real"):
+        return JSONResponse({"error": "backend must be 'mock' or 'real'"}, status_code=400)
+
+    if agent and agent.running:
+        return JSONResponse({"error": "Stop the agent before switching backends"}, status_code=400)
+
+    # Update the .env file
+    import os
+    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            lines = f.readlines()
+        found = False
+        new_lines = []
+        for line in lines:
+            if line.strip().startswith("BF_TRADING_BACKEND"):
+                new_lines.append(f"BF_TRADING_BACKEND={target}\n")
+                found = True
+            else:
+                new_lines.append(line)
+        if not found:
+            new_lines.append(f"BF_TRADING_BACKEND={target}\n")
+        with open(env_path, "w") as f:
+            f.writelines(new_lines)
+
+    # Force recreate agent on next start
+    agent = None
+    agent_thread = None
+
+    # Clear settings cache by reloading
+    os.environ["BF_TRADING_BACKEND"] = target
+
+    return {"status": "ok", "backend": target}
+
+
+_agent_lock = threading.Lock()
 
 
 @app.post("/api/agent/start")
 def api_agent_start():
     global agent_thread
-    a = get_or_create_agent()
-    if a.running:
-        return {"status": "already_running", "cycle": a.cycle_count}
-    agent_thread = threading.Thread(target=a.run, daemon=True, name="buckfiddy-agent")
-    agent_thread.start()
+    with _agent_lock:
+        a = get_or_create_agent()
+        if a.running or (agent_thread and agent_thread.is_alive()):
+            return {"status": "already_running", "cycle": a.cycle_count}
+        agent_thread = threading.Thread(target=a.run, daemon=True, name="buckfiddy-agent")
+        agent_thread.start()
     return {"status": "started"}
 
 
@@ -284,11 +408,12 @@ def api_agent_stop():
 @app.post("/api/agent/single")
 def api_agent_single():
     global agent_thread
-    a = get_or_create_agent()
-    if a.running:
-        return JSONResponse({"error": "Agent is already running"}, status_code=400)
-    agent_thread = threading.Thread(target=a.run_single_cycle, daemon=True, name="buckfiddy-single")
-    agent_thread.start()
+    with _agent_lock:
+        a = get_or_create_agent()
+        if a.running or (agent_thread and agent_thread.is_alive()):
+            return JSONResponse({"error": "Agent is already running"}, status_code=400)
+        agent_thread = threading.Thread(target=a.run_single_cycle, daemon=True, name="buckfiddy-single")
+        agent_thread.start()
     return {"status": "started_single"}
 
 
@@ -335,34 +460,47 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <body class="min-h-screen p-6">
 
 <div class="max-w-7xl mx-auto">
+  <!-- Status Banner -->
+  <div id="status-banner" class="mb-6 rounded-xl px-5 py-3 flex items-center justify-between border transition-all duration-300 bg-slate-900/50 border-slate-800">
+    <div class="flex items-center gap-4">
+      <span id="status-dot" class="w-3 h-3 rounded-full bg-slate-600 shrink-0"></span>
+      <div>
+        <span id="status-text" class="text-sm font-semibold text-slate-400">Stopped</span>
+        <span id="status-detail" class="text-xs text-slate-600 ml-3"></span>
+      </div>
+    </div>
+    <div class="flex items-center gap-2">
+      <span id="last-update" class="text-xs text-slate-600 mr-2"></span>
+      <button id="btn-start" onclick="agentStart()" class="px-4 py-2 text-sm font-medium text-green-400 border border-green-900 rounded-lg hover:bg-green-900/30 transition-colors">Start Agent</button>
+      <button id="btn-single" onclick="agentSingle()" class="px-4 py-2 text-sm font-medium text-blue-400 border border-blue-900 rounded-lg hover:bg-blue-900/30 transition-colors">Run 1 Cycle</button>
+      <button id="btn-stop" onclick="agentStop()" class="px-4 py-2 text-sm font-medium text-amber-400 border border-amber-900 rounded-lg hover:bg-amber-900/30 transition-colors hidden">Stop Agent</button>
+      <select id="backend-select" onchange="switchBackend(this.value)" class="px-3 py-2 text-sm font-medium text-slate-300 bg-slate-800 border border-slate-700 rounded-lg cursor-pointer">
+        <option value="mock">Mock Trading</option>
+        <option value="real">Real Trading</option>
+      </select>
+      <button onclick="resetData()" class="px-4 py-2 text-sm font-medium text-red-400 border border-red-900/50 rounded-lg hover:bg-red-900/30 transition-colors">Reset</button>
+    </div>
+  </div>
+
   <!-- Header -->
   <div class="flex items-center justify-between mb-8">
     <div>
       <h1 class="text-3xl font-bold text-white">BuckFiddy</h1>
-      <p class="text-sm text-slate-500 mt-1">Autonomous Polymarket Trading Agent</p>
-    </div>
-    <div class="flex items-center gap-3">
-      <span id="status-dot" class="w-2 h-2 rounded-full bg-slate-600"></span>
-      <span id="status-text" class="text-xs text-slate-500">Loading...</span>
-      <span id="last-update" class="text-xs text-slate-600 ml-4"></span>
-      <div class="flex items-center gap-2 ml-4">
-        <button id="btn-start" onclick="agentStart()" class="px-3 py-1.5 text-xs font-medium text-green-400 border border-green-900 rounded-lg hover:bg-green-900/30 transition-colors">Start Agent</button>
-        <button id="btn-single" onclick="agentSingle()" class="px-3 py-1.5 text-xs font-medium text-blue-400 border border-blue-900 rounded-lg hover:bg-blue-900/30 transition-colors">Run 1 Cycle</button>
-        <button id="btn-stop" onclick="agentStop()" class="px-3 py-1.5 text-xs font-medium text-amber-400 border border-amber-900 rounded-lg hover:bg-amber-900/30 transition-colors hidden">Stop Agent</button>
-        <button onclick="resetData()" class="px-3 py-1.5 text-xs font-medium text-red-400 border border-red-900 rounded-lg hover:bg-red-900/30 transition-colors">Reset</button>
-      </div>
+      <p class="text-sm text-slate-500 mt-1">Autonomous Polymarket Trading Agent
+        <span id="backend-badge" class="ml-2 px-2 py-0.5 rounded text-xs font-medium bg-blue-900/50 text-blue-400 border border-blue-800">MOCK</span>
+      </p>
     </div>
   </div>
 
   <!-- Stats Row -->
   <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-4 mb-6">
     <div class="card p-4">
-      <div class="text-xs text-slate-500 uppercase tracking-wider">Balance</div>
-      <div id="stat-balance" class="text-xl font-bold text-white mt-1">-</div>
+      <div class="text-xs text-slate-500 uppercase tracking-wider">Cash</div>
+      <div id="stat-cash" class="text-xl font-bold text-white mt-1">-</div>
     </div>
     <div class="card p-4">
-      <div class="text-xs text-slate-500 uppercase tracking-wider">Equity</div>
-      <div id="stat-equity" class="text-xl font-bold text-white mt-1">-</div>
+      <div class="text-xs text-slate-500 uppercase tracking-wider">Total Value</div>
+      <div id="stat-total-value" class="text-xl font-bold text-white mt-1">-</div>
     </div>
     <div class="card p-4">
       <div class="text-xs text-slate-500 uppercase tracking-wider">P&L</div>
@@ -474,8 +612,8 @@ async function updateSummary() {
   const d = await fetchJson('/api/summary');
   if (!d) return;
 
-  $('stat-balance').textContent = fmtUsd(d.balance);
-  $('stat-equity').textContent = fmtUsd(d.equity);
+  $('stat-cash').textContent = fmtUsd(d.cash);
+  $('stat-total-value').textContent = fmtUsd(d.total_value);
 
   const pnlEl = $('stat-pnl');
   pnlEl.textContent = fmtUsd(d.pnl) + ' (' + fmtPct(d.pnl_pct) + ')';
@@ -495,13 +633,44 @@ async function updateAgentStatus() {
   const d = await fetchJson('/api/agent/status');
   if (!d) return;
   const running = d.running;
-  $('status-dot').className = 'w-2 h-2 rounded-full ' + (running ? 'bg-green-500 pulse' : 'bg-slate-600');
-  $('status-text').textContent = running ? 'Running — Cycle ' + d.cycle : 'Stopped';
+  const banner = $('status-banner');
+
+  if (running) {
+    banner.className = 'mb-6 rounded-xl px-5 py-3 flex items-center justify-between border transition-all duration-300 bg-green-950/40 border-green-800';
+    $('status-dot').className = 'w-3 h-3 rounded-full bg-green-500 pulse shrink-0';
+    $('status-text').textContent = 'AGENT RUNNING';
+    $('status-text').className = 'text-sm font-bold text-green-400';
+    $('status-detail').textContent = 'Cycle ' + d.cycle + ' — API costs are accumulating';
+    $('status-detail').className = 'text-xs text-green-600 ml-3';
+    document.title = 'RUNNING — BuckFiddy';
+  } else {
+    banner.className = 'mb-6 rounded-xl px-5 py-3 flex items-center justify-between border transition-all duration-300 bg-slate-900/50 border-slate-800';
+    $('status-dot').className = 'w-3 h-3 rounded-full bg-slate-600 shrink-0';
+    $('status-text').textContent = 'STOPPED';
+    $('status-text').className = 'text-sm font-semibold text-slate-400';
+    $('status-detail').textContent = d.cycle > 0 ? 'Completed ' + d.cycle + ' cycles' : '';
+    $('status-detail').className = 'text-xs text-slate-600 ml-3';
+    document.title = 'BuckFiddy Dashboard';
+    $('btn-stop').disabled = false;
+    $('btn-stop').textContent = 'Stop Agent';
+  }
+
   $('btn-start').classList.toggle('hidden', running);
   $('btn-single').classList.toggle('hidden', running);
   $('btn-stop').classList.toggle('hidden', !running);
-  // Reset stop button state when agent has stopped
-  if (!running) { $('btn-stop').disabled = false; $('btn-stop').textContent = 'Stop Agent'; }
+
+  // Backend badge + select
+  const be = d.backend || 'mock';
+  const badge = $('backend-badge');
+  if (be === 'real') {
+    badge.textContent = 'REAL';
+    badge.className = 'ml-2 px-2 py-0.5 rounded text-xs font-medium bg-red-900/50 text-red-400 border border-red-800';
+  } else {
+    badge.textContent = 'MOCK';
+    badge.className = 'ml-2 px-2 py-0.5 rounded text-xs font-medium bg-blue-900/50 text-blue-400 border border-blue-800';
+  }
+  $('backend-select').value = be;
+  $('backend-select').disabled = running;
 }
 
 async function updateEquityChart() {
@@ -607,14 +776,16 @@ async function updatePositions() {
       <th class="text-left pb-2">Side</th>
       <th class="text-right pb-2">Shares</th>
       <th class="text-right pb-2">Entry</th>
-      <th class="text-right pb-2">Opened</th>
+      <th class="text-right pb-2">Value</th>
+      <th class="text-right pb-2">P&L</th>
     </tr></thead>
     <tbody>${data.map(p => `<tr class="border-t border-slate-800">
-      <td class="py-2 pr-3 max-w-[250px] truncate">${p.market_question}</td>
+      <td class="py-2 pr-3 max-w-[200px] truncate" title="${(p.market_question || '').replace(/"/g, '&quot;')}">${p.market_question}</td>
       <td><span class="px-2 py-0.5 rounded text-xs font-medium badge-yes">${p.outcome}</span></td>
       <td class="text-right font-mono">${p.size.toFixed(1)}</td>
       <td class="text-right font-mono">$${p.avg_entry_price.toFixed(3)}</td>
-      <td class="text-right text-slate-500">${fmtTime(p.created_at)}</td>
+      <td class="text-right font-mono">${fmtUsd(p.current_value)}</td>
+      <td class="text-right font-mono ${pnlClass(p.unrealized_pnl)}">${fmtUsd(p.unrealized_pnl)} (${fmtPct(p.unrealized_pnl_pct * 100)})</td>
     </tr>`).join('')}</tbody></table>`;
 }
 
@@ -626,20 +797,23 @@ async function updateTrades() {
   el.innerHTML = `<table class="w-full text-sm">
     <thead><tr class="text-slate-500 text-xs uppercase">
       <th class="text-left pb-2">Time</th>
+      <th class="text-left pb-2">Market</th>
       <th class="text-left pb-2">Side</th>
-      <th class="text-left pb-2">Outcome</th>
       <th class="text-right pb-2">Price</th>
       <th class="text-right pb-2">Size</th>
+      <th class="text-right pb-2">Edge</th>
       <th class="text-right pb-2">P&L</th>
     </tr></thead>
-    <tbody>${data.map(t => `<tr class="border-t border-slate-800">
+    <tbody>${data.map(t => `<tr class="border-t border-slate-800 ${t.reasoning ? 'cursor-pointer' : ''}" ${t.reasoning ? 'onclick="this.nextElementSibling.classList.toggle(\'hidden\')"' : ''}>
       <td class="py-2 text-slate-400">${fmtTime(t.executed_at)}</td>
-      <td><span class="px-2 py-0.5 rounded text-xs font-medium ${t.side === 'BUY' ? 'badge-buy' : 'badge-sell'}">${t.side}</span></td>
-      <td class="max-w-[150px] truncate">${t.outcome}</td>
+      <td class="max-w-[250px] truncate" title="${(t.market_question || '').replace(/"/g, '&quot;')}">${t.market_question || t.outcome}</td>
+      <td><span class="px-2 py-0.5 rounded text-xs font-medium ${t.side === 'BUY' ? 'badge-buy' : 'badge-sell'}">${t.side} ${t.outcome}</span></td>
       <td class="text-right font-mono">$${t.price.toFixed(3)}</td>
       <td class="text-right font-mono">${t.size.toFixed(1)}</td>
+      <td class="text-right font-mono ${t.edge ? pnlClass(t.edge) : 'text-slate-600'}">${t.edge ? (t.edge * 100).toFixed(1) + '%' : '-'}</td>
       <td class="text-right font-mono ${t.pnl !== null ? pnlClass(t.pnl) : 'text-slate-600'}">${t.pnl !== null ? '$' + t.pnl.toFixed(2) : '-'}</td>
-    </tr>`).join('')}</tbody></table>`;
+    </tr>
+    ${t.reasoning ? '<tr class="hidden border-t border-slate-800/50"><td colspan="7" class="py-3 px-4"><div class="text-xs text-slate-400 whitespace-pre-wrap bg-slate-900/50 rounded-lg p-3"><span class="text-slate-500 font-semibold">Claude\\'s estimate:</span> ' + (t.claude_estimate * 100).toFixed(1) + '% vs market ' + (t.market_midpoint * 100).toFixed(1) + '%<br><br>' + t.reasoning + '</div></td></tr>' : ''}`).join('')}</tbody></table>`;
 }
 
 async function updateEstimatesTable() {
@@ -689,6 +863,21 @@ async function updateCycles() {
       ${c.summary ? '<p class="text-xs text-slate-600 mt-1 line-clamp-3">' + c.summary.slice(0, 300) + '</p>' : ''}
     </div>
   `).join('');
+}
+
+async function switchBackend(target) {
+  const r = await fetch('/api/backend/switch', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({backend: target})
+  });
+  if (r.ok) {
+    updateAgentStatus();
+  } else {
+    const d = await r.json();
+    alert(d.error || 'Switch failed');
+    updateAgentStatus();  // Reset select to actual value
+  }
 }
 
 async function agentStart() {

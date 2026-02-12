@@ -124,6 +124,10 @@ TOOLS = [
                     "type": "number",
                     "description": "Number of shares",
                 },
+                "estimate_id": {
+                    "type": "integer",
+                    "description": "The estimate_id from submit_probability_estimate that led to this trade",
+                },
             },
             "required": ["token_id", "side", "price", "size"],
         },
@@ -149,6 +153,10 @@ TOOLS = [
                 "amount": {
                     "type": "number",
                     "description": "Dollar amount (BUY) or number of shares (SELL)",
+                },
+                "estimate_id": {
+                    "type": "integer",
+                    "description": "The estimate_id from submit_probability_estimate that led to this trade",
                 },
             },
             "required": ["token_id", "side", "amount"],
@@ -310,9 +318,9 @@ class ToolDispatcher:
         abs_edge = abs(edge)
         tradeable = abs_edge >= self.settings.EDGE_THRESHOLD
 
-        # Log the estimate
+        # Log the estimate and get its ID
         now = datetime.now(timezone.utc).isoformat()
-        self.store.execute(
+        cursor = self.store.execute(
             "INSERT INTO estimates (market_id, token_id, outcome, market_question, "
             "claude_estimate, market_midpoint, edge, reasoning, tradeable, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -329,6 +337,7 @@ class ToolDispatcher:
                 now,
             ),
         )
+        estimate_id = cursor.lastrowid
         self.store.commit()
 
         logger.info(
@@ -414,6 +423,7 @@ class ToolDispatcher:
             )
 
         result = {
+            "estimate_id": estimate_id,
             "your_estimate": estimate,
             "market_midpoint": midpoint,
             "best_bid": real_price.best_bid,
@@ -437,6 +447,7 @@ class ToolDispatcher:
             side=input["side"],
             price=input["price"],
             size=input["size"],
+            estimate_id=input.get("estimate_id"),
         )
         return result.model_dump()
 
@@ -445,6 +456,7 @@ class ToolDispatcher:
             token_id=input["token_id"],
             side=input["side"],
             amount=input["amount"],
+            estimate_id=input.get("estimate_id"),
         )
         return result.model_dump()
 

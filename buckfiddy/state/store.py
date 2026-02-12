@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS orders (
     price REAL NOT NULL,
     size REAL NOT NULL,
     status TEXT NOT NULL DEFAULT 'OPEN',
+    estimate_id INTEGER,
     created_at TEXT NOT NULL
 );
 
@@ -41,6 +42,7 @@ CREATE TABLE IF NOT EXISTS trades (
     price REAL NOT NULL,
     size REAL NOT NULL,
     pnl REAL,
+    estimate_id INTEGER,
     executed_at TEXT NOT NULL
 );
 
@@ -99,7 +101,7 @@ CREATE TABLE IF NOT EXISTS equity_snapshots (
 
 
 class StateStore:
-    def __init__(self, db_path: str, check_same_thread: bool = True):
+    def __init__(self, db_path: str, check_same_thread: bool = False):
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         self.conn = sqlite3.connect(db_path, check_same_thread=check_same_thread)
         self.conn.row_factory = sqlite3.Row

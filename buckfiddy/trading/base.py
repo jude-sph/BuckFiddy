@@ -12,11 +12,13 @@ class TradingBackend(Protocol):
     def get_market_price(self, token_id: str) -> MarketPrice: ...
 
     def place_limit_order(
-        self, token_id: str, side: str, price: float, size: float
+        self, token_id: str, side: str, price: float, size: float,
+        estimate_id: int | None = None,
     ) -> TradeResult: ...
 
     def place_market_order(
-        self, token_id: str, side: str, amount: float
+        self, token_id: str, side: str, amount: float,
+        estimate_id: int | None = None,
     ) -> TradeResult: ...
 
     def cancel_order(self, order_id: str) -> TradeResult: ...

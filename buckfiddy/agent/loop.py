@@ -19,8 +19,10 @@ logger = logging.getLogger(__name__)
 # Cost per million tokens by model (input, output)
 MODEL_COSTS = {
     "claude-sonnet-4-5-20250929": (3.0, 15.0),
+    "claude-sonnet-4-5": (3.0, 15.0),
     "claude-opus-4-6": (5.0, 25.0),
     "claude-haiku-4-5-20251001": (1.0, 5.0),
+    "claude-haiku-4-5": (1.0, 5.0),
 }
 WEB_SEARCH_COST_PER = 0.01  # $10 per 1000 searches
 
@@ -64,7 +66,10 @@ class AgentLoop:
         scanner: MarketScanner,
         settings: Settings,
     ):
-        self.client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        client_kwargs = {"api_key": settings.ANTHROPIC_API_KEY}
+        if settings.ANTHROPIC_BASE_URL:
+            client_kwargs["base_url"] = settings.ANTHROPIC_BASE_URL
+        self.client = anthropic.Anthropic(**client_kwargs)
         self.backend = backend
         self.scanner = scanner
         self.settings = settings
@@ -308,9 +313,16 @@ class AgentLoop:
 
     def _log_cycle(self, summary: str, stop_losses: int, usage: CycleUsage):
         try:
-            wallet = self.backend.get_wallet_state()
             now = datetime.now(timezone.utc).isoformat()
             cost = usage.calculate_cost(self.settings.CLAUDE_MODEL)
+
+            # Deduct API cost from mock balance (real costs reduce real money)
+            if cost > 0 and hasattr(self.backend, '_set_balance'):
+                current_bal = self.backend._get_balance()
+                self.backend._set_balance(round(current_bal - cost, 6))
+                logger.info(f"Deducted ${cost:.4f} API cost from balance")
+
+            wallet = self.backend.get_wallet_state()
 
             # Final flush of API usage (updates existing row from _flush_usage)
             self._flush_usage(usage)

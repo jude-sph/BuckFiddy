@@ -9,6 +9,7 @@ class Settings(BaseSettings):
 
     # Claude API
     ANTHROPIC_API_KEY: str = ""
+    ANTHROPIC_BASE_URL: str = ""  # Custom endpoint (e.g. Azure-hosted)
     CLAUDE_MODEL: str = "claude-sonnet-4-5-20250929"
     CLAUDE_MAX_TOKENS: int = 4096
 

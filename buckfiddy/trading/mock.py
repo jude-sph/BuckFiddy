@@ -175,7 +175,8 @@ class MockTradingBackend:
         )
 
     def place_limit_order(
-        self, token_id: str, side: str, price: float, size: float
+        self, token_id: str, side: str, price: float, size: float,
+        estimate_id: int | None = None,
     ) -> TradeResult:
         meta = self._get_token_meta(token_id)
         balance = self._get_balance()
@@ -204,7 +205,7 @@ class MockTradingBackend:
 
         if can_fill:
             return self._execute_fill(
-                order_id, token_id, meta, side, mid, size, now
+                order_id, token_id, meta, side, mid, size, now, estimate_id
             )
 
         # Otherwise, place as open order (will be checked on future cycles)
@@ -212,7 +213,9 @@ class MockTradingBackend:
             self._set_balance(balance - price * size)
 
         self.store.execute(
-            "INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)",
+            "INSERT INTO orders (order_id, market_id, token_id, outcome, side, "
+            "price, size, status, estimate_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)",
             (
                 order_id,
                 meta["market_id"],
@@ -221,6 +224,7 @@ class MockTradingBackend:
                 side,
                 price,
                 size,
+                estimate_id,
                 now,
             ),
         )
@@ -233,7 +237,8 @@ class MockTradingBackend:
         )
 
     def place_market_order(
-        self, token_id: str, side: str, amount: float
+        self, token_id: str, side: str, amount: float,
+        estimate_id: int | None = None,
     ) -> TradeResult:
         meta = self._get_token_meta(token_id)
         balance = self._get_balance()
@@ -255,12 +260,12 @@ class MockTradingBackend:
         if side == "BUY":
             size = amount / mid
             return self._execute_fill(
-                order_id, token_id, meta, "BUY", mid, size, now
+                order_id, token_id, meta, "BUY", mid, size, now, estimate_id
             )
         else:
             # SELL: amount is number of shares to sell
             return self._execute_fill(
-                order_id, token_id, meta, "SELL", mid, amount, now
+                order_id, token_id, meta, "SELL", mid, amount, now, estimate_id
             )
 
     def _execute_fill(
@@ -272,6 +277,7 @@ class MockTradingBackend:
         fill_price: float,
         size: float,
         now: str,
+        estimate_id: int | None = None,
     ) -> TradeResult:
         balance = self._get_balance()
         pnl = None
@@ -305,7 +311,9 @@ class MockTradingBackend:
         # Record the trade
         trade_id = str(uuid4())[:8]
         self.store.execute(
-            "INSERT INTO trades VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO trades (trade_id, order_id, market_id, token_id, outcome, "
+            "side, price, size, pnl, estimate_id, executed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 trade_id,
                 order_id,
@@ -316,13 +324,16 @@ class MockTradingBackend:
                 fill_price,
                 size,
                 pnl,
+                estimate_id,
                 now,
             ),
         )
 
         # Record the order as filled
         self.store.execute(
-            "INSERT OR REPLACE INTO orders VALUES (?, ?, ?, ?, ?, ?, ?, 'FILLED', ?)",
+            "INSERT OR REPLACE INTO orders (order_id, market_id, token_id, outcome, "
+            "side, price, size, status, estimate_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'FILLED', ?, ?)",
             (
                 order_id,
                 meta["market_id"],
@@ -331,6 +342,7 @@ class MockTradingBackend:
                 side,
                 fill_price,
                 size,
+                estimate_id,
                 now,
             ),
         )
