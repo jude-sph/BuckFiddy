@@ -1,0 +1,25 @@
+[project]
+name = "buckfiddy"
+version = "0.1.0"
+description = "Autonomous Claude-powered Polymarket trading agent"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40.0",
+    "py-clob-client>=0.17.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "requests>=2.31",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+buckfiddy = "buckfiddy.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
