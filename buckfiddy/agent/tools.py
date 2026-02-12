@@ -234,6 +234,25 @@ WEB_SEARCH_TOOL = {
     "blocked_domains": BLOCKED_DOMAINS,
 }
 
+# --- Tool subsets per phase ---
+
+# Tool name lookups
+_TOOL_BY_NAME = {t["name"]: t for t in TOOLS}
+
+POSITION_REVIEW_TOOLS = [
+    _TOOL_BY_NAME["review_position"],
+    _TOOL_BY_NAME["submit_probability_estimate"],
+    _TOOL_BY_NAME["close_position"],
+]
+
+RESEARCH_TRADE_TOOLS = [
+    _TOOL_BY_NAME["submit_probability_estimate"],
+    _TOOL_BY_NAME["place_market_order"],
+    _TOOL_BY_NAME["place_limit_order"],
+]
+
+FULL_CYCLE_TOOLS = TOOLS  # All tools for the monolithic fallback
+
 
 class ToolDispatcher:
     def __init__(self, backend, scanner: MarketScanner, settings: Settings):
@@ -242,6 +261,11 @@ class ToolDispatcher:
         self.settings = settings
         self.store = StateStore(settings.DB_PATH)
         self._market_end_dates: dict[str, str] = {}  # market_id -> end_date
+        self._new_estimates_this_cycle: int = 0  # Counter for new market estimates
+
+    def reset_cycle_counters(self):
+        """Reset per-cycle counters. Call at the start of each cycle."""
+        self._new_estimates_this_cycle = 0
 
     def dispatch(self, tool_name: str, tool_input: dict) -> str:
         """Execute a tool and return the JSON result string."""
@@ -273,7 +297,10 @@ class ToolDispatcher:
         return wallet.model_dump()
 
     def _handle_scan_markets(self, input: dict) -> dict:
-        max_results = input.get("max_results", 10)
+        max_results = min(
+            input.get("max_results", self.settings.MAX_MARKETS_PER_SCAN),
+            self.settings.MAX_MARKETS_PER_SCAN,
+        )
         markets = self.scanner.scan(max_results=max_results)
 
         # Register token metadata so the mock backend can track positions
@@ -311,6 +338,25 @@ class ToolDispatcher:
         outcome = input["outcome"]
         estimate = input["estimated_probability"]
         reasoning = input["reasoning"]
+
+        # Check if this is a new-market estimate (not a position review)
+        wallet = self.backend.get_wallet_state()
+        is_position_review = any(
+            p.token_id == token_id or p.market_id == market_id
+            for p in wallet.positions
+        )
+
+        if not is_position_review:
+            if self._new_estimates_this_cycle >= self.settings.MAX_NEW_ESTIMATES_PER_CYCLE:
+                return {
+                    "error": (
+                        f"Estimate limit reached: you have already submitted "
+                        f"{self._new_estimates_this_cycle} new market estimates this cycle "
+                        f"(max {self.settings.MAX_NEW_ESTIMATES_PER_CYCLE}). "
+                        f"Move on to your summary."
+                    )
+                }
+            self._new_estimates_this_cycle += 1
 
         # Fetch the real price AFTER Claude has committed its estimate
         real_price: MarketPrice = self.backend.get_market_price(token_id)
@@ -353,7 +399,7 @@ class ToolDispatcher:
         )
 
         # Check if Claude already holds a position in this market
-        wallet = self.backend.get_wallet_state()
+        # (wallet already fetched above for estimate counter check)
         balance = wallet.balance
         held_position = next(
             (p for p in wallet.positions if p.token_id == token_id),

@@ -191,6 +191,13 @@ def api_summary():
 
     settings = Settings()
 
+    # Model names (short form for display)
+    def _short_model(m):
+        parts = m.split("-")
+        if len(parts) >= 2:
+            return parts[1].capitalize() + (" " + parts[2] if len(parts) > 2 else "")
+        return m
+
     return {
         "cash": round(cash, 2),
         "position_value": round(pos_value, 2),
@@ -208,6 +215,8 @@ def api_summary():
         "realized_pnl": round(realized["v"], 2) if realized else 0,
         "estimates": est_count["n"] if est_count else 0,
         "tradeable_edges": tradeable_count["n"] if tradeable_count else 0,
+        "model_fast": _short_model(settings.CLAUDE_MODEL_FAST),
+        "model_research": _short_model(settings.CLAUDE_MODEL_RESEARCH),
     }
 
 
@@ -513,6 +522,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <p class="text-sm text-slate-500 mt-1">Autonomous Polymarket Trading Agent
         <span id="backend-badge" class="ml-2 px-2 py-0.5 rounded text-xs font-medium bg-blue-900/50 text-blue-400 border border-blue-800">MOCK</span>
       </p>
+      <p id="model-config" class="text-xs text-slate-600 mt-1"></p>
     </div>
   </div>
 
@@ -702,6 +712,11 @@ async function updateSummary() {
   $('stat-winrate').textContent = closed > 0 ? Math.round(d.wins / closed * 100) + '%' : '-';
 
   $('last-update').textContent = 'Updated ' + new Date().toLocaleTimeString();
+
+  // Model config
+  if (d.model_fast || d.model_research) {
+    $('model-config').textContent = 'Fast: ' + (d.model_fast || '?') + ' | Research: ' + (d.model_research || '?');
+  }
 }
 
 async function updateAgentStatus() {
