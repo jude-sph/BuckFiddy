@@ -131,16 +131,8 @@ class AgentLoop:
         for turn in range(max_turns):
             logger.debug(f"Agent turn {turn + 1}")
 
-            try:
-                response = self.client.messages.create(
-                    model=self.settings.CLAUDE_MODEL,
-                    max_tokens=self.settings.CLAUDE_MAX_TOKENS,
-                    system=self.system_prompt,
-                    tools=all_tools,
-                    messages=messages,
-                )
-            except anthropic.APIError as e:
-                logger.error(f"Claude API error: {e}")
+            response = self._api_call_with_retry(all_tools, messages)
+            if response is None:
                 break
 
             # Track API usage
@@ -185,6 +177,31 @@ class AgentLoop:
                 break
 
         return summary
+
+    def _api_call_with_retry(self, tools, messages, max_retries: int = 5):
+        """Make an API call with exponential backoff for rate limits."""
+        for attempt in range(max_retries):
+            try:
+                return self.client.messages.create(
+                    model=self.settings.CLAUDE_MODEL,
+                    max_tokens=self.settings.CLAUDE_MAX_TOKENS,
+                    system=self.system_prompt,
+                    tools=tools,
+                    messages=messages,
+                )
+            except anthropic.RateLimitError as e:
+                wait = min(2 ** attempt * 15, 120)  # 15s, 30s, 60s, 120s, 120s
+                logger.warning(
+                    f"Rate limited (attempt {attempt + 1}/{max_retries}), "
+                    f"waiting {wait}s..."
+                )
+                time.sleep(wait)
+            except anthropic.APIError as e:
+                logger.error(f"Claude API error: {e}")
+                return None
+
+        logger.error("Rate limit retries exhausted")
+        return None
 
     def _build_cycle_message(self) -> str:
         parts = [

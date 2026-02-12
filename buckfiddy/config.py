@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     # Market filters
     MIN_MARKET_LIQUIDITY: float = 5000.0
     MIN_MARKET_VOLUME: float = 10000.0
-    MAX_MARKETS_PER_SCAN: int = 20
+    MAX_MARKETS_PER_SCAN: int = 5
 
     # Persistence
     DB_PATH: str = "data/buckfiddy.db"
