@@ -305,7 +305,16 @@ class ToolDispatcher:
 
     def _handle_get_wallet_state(self, _input: dict) -> dict:
         wallet = self.backend.get_wallet_state()
-        return wallet.model_dump()
+        # Strip price-derived fields to prevent Claude from reverse-engineering
+        # current market prices (current_value / size = midpoint)
+        data = wallet.model_dump()
+        for pos in data.get("positions", []):
+            pos.pop("current_value", None)
+            pos.pop("unrealized_pnl", None)
+            pos.pop("unrealized_pnl_pct", None)
+        # Also strip total_position_value (sum of current_values)
+        data.pop("total_position_value", None)
+        return data
 
     def _handle_scan_markets(self, input: dict) -> dict:
         max_results = min(

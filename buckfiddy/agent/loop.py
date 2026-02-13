@@ -253,7 +253,6 @@ class AgentLoop:
         # Build a rich user message with all position details baked in
         lines = [
             f"Your current balance: ${wallet.balance:.2f}",
-            f"Total equity: ${wallet.total_equity:.2f}",
             f"You have {len(wallet.positions)} open position(s) to review.\n",
         ]
         for i, pos in enumerate(wallet.positions, 1):
