@@ -389,6 +389,7 @@ def api_agent_status():
         "phase": a.current_phase if a else "",
         "full_interval": a.settings.FULL_CYCLE_INTERVAL_SECONDS if a else settings.FULL_CYCLE_INTERVAL_SECONDS,
         "light_interval": a.settings.POSITION_CHECK_INTERVAL_SECONDS if a else settings.POSITION_CHECK_INTERVAL_SECONDS,
+        "markets_per_cycle": a.settings.MAX_NEW_ESTIMATES_PER_CYCLE if a else settings.MAX_NEW_ESTIMATES_PER_CYCLE,
     }
 
 
@@ -483,6 +484,7 @@ def api_models_switch(body: dict):
 def api_timing_update(body: dict):
     full = body.get("full_interval")
     light = body.get("light_interval")
+    markets = body.get("markets_per_cycle")
 
     a = get_or_create_agent()
     if full is not None:
@@ -491,11 +493,15 @@ def api_timing_update(body: dict):
     if light is not None:
         val = max(30, int(light))  # Minimum 30 seconds
         a.settings.POSITION_CHECK_INTERVAL_SECONDS = val
+    if markets is not None:
+        val = max(1, min(5, int(markets)))  # 1-5 markets
+        a.settings.MAX_NEW_ESTIMATES_PER_CYCLE = val
 
     return {
         "status": "ok",
         "full_interval": a.settings.FULL_CYCLE_INTERVAL_SECONDS,
         "light_interval": a.settings.POSITION_CHECK_INTERVAL_SECONDS,
+        "markets_per_cycle": a.settings.MAX_NEW_ESTIMATES_PER_CYCLE,
     }
 
 
@@ -633,6 +639,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <span class="text-xs text-slate-600">min, check every</span>
         <input id="timing-light" type="number" min="1" step="1" class="w-12 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateTiming()">
         <span class="text-xs text-slate-600">min</span>
+        <span class="text-slate-700 mx-1">|</span>
+        <span class="text-xs text-slate-600">Research</span>
+        <input id="timing-markets" type="number" min="1" max="5" step="1" class="w-12 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateTiming()">
+        <span class="text-xs text-slate-600">markets/cycle</span>
       </div>
     </div>
   </div>
@@ -889,6 +899,9 @@ async function updateAgentStatus() {
   if (d.light_interval && !$('timing-light').matches(':focus')) {
     $('timing-light').value = Math.round(d.light_interval / 60);
   }
+  if (d.markets_per_cycle && !$('timing-markets').matches(':focus')) {
+    $('timing-markets').value = d.markets_per_cycle;
+  }
 
   $('btn-start').classList.toggle('hidden', running);
   $('btn-single').classList.toggle('hidden', running);
@@ -1143,10 +1156,11 @@ async function switchModel(role, modelId) {
 async function updateTiming() {
   const fullMin = parseInt($('timing-full').value) || 120;
   const lightMin = parseInt($('timing-light').value) || 30;
+  const markets = parseInt($('timing-markets').value) || 2;
   await fetch('/api/timing/update', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ full_interval: fullMin * 60, light_interval: lightMin * 60 })
+    body: JSON.stringify({ full_interval: fullMin * 60, light_interval: lightMin * 60, markets_per_cycle: markets })
   });
 }
 

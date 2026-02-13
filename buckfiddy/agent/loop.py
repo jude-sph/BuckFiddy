@@ -221,8 +221,9 @@ class AgentLoop:
         )
 
         # Phase 3: Research + trade per market (Sonnet/Opus, fresh conversation each)
-        for i, market_info in enumerate(selected[:2]):
-            self.current_phase = f"Research ({i+1}/{len(selected[:2])})"
+        max_research = self.settings.MAX_NEW_ESTIMATES_PER_CYCLE
+        for i, market_info in enumerate(selected[:max_research]):
+            self.current_phase = f"Research ({i+1}/{len(selected[:max_research])})"
             logger.info(
                 f"Phase 3.{i+1}: Researching '{market_info.get('question', '?')[:60]}'"
             )
