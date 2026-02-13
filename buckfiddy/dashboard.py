@@ -720,7 +720,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="card p-6 mb-6">
     <div class="flex items-center justify-between mb-4">
       <h2 class="text-sm font-semibold text-slate-400 uppercase tracking-wider">Terminal Output</h2>
-      <button onclick="$('log-output').textContent=''; logCursor=0;" class="text-xs text-slate-600 hover:text-slate-400 transition-colors">Clear</button>
+      <button onclick="$('log-output').textContent='';" class="text-xs text-slate-600 hover:text-slate-400 transition-colors">Clear</button>
     </div>
     <div id="log-output" class="bg-black/50 rounded-lg p-4 font-mono text-xs text-green-400 h-80 overflow-y-auto whitespace-pre-wrap leading-relaxed border border-slate-800"></div>
   </div>
