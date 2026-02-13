@@ -189,7 +189,9 @@ def api_summary():
         "SELECT COUNT(*) as n FROM estimates WHERE tradeable = 1"
     )
 
-    settings = Settings()
+    # Use agent's live settings (reflects model switches) instead of fresh Settings()
+    a = get_or_create_agent()
+    live_settings = a.settings
 
     # Model names (short form for display)
     def _short_model(m):
@@ -210,15 +212,15 @@ def api_summary():
         "cycles": cycles["n"] if cycles else 0,
         "total_trades": total_trades["n"] if total_trades else 0,
         "wins": wins["n"] if wins else 0,
-        "backend": settings.TRADING_BACKEND,
+        "backend": live_settings.TRADING_BACKEND,
         "losses": losses["n"] if losses else 0,
         "realized_pnl": round(realized["v"], 2) if realized else 0,
         "estimates": est_count["n"] if est_count else 0,
         "tradeable_edges": tradeable_count["n"] if tradeable_count else 0,
-        "model_fast": _short_model(settings.CLAUDE_MODEL_FAST),
-        "model_fast_id": settings.CLAUDE_MODEL_FAST,
-        "model_research": _short_model(settings.CLAUDE_MODEL_RESEARCH),
-        "model_research_id": settings.CLAUDE_MODEL_RESEARCH,
+        "model_fast": _short_model(live_settings.CLAUDE_MODEL_FAST),
+        "model_fast_id": live_settings.CLAUDE_MODEL_FAST,
+        "model_research": _short_model(live_settings.CLAUDE_MODEL_RESEARCH),
+        "model_research_id": live_settings.CLAUDE_MODEL_RESEARCH,
     }
 
 
