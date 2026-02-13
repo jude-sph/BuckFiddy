@@ -10,9 +10,9 @@ class Settings(BaseSettings):
     # Claude API
     ANTHROPIC_API_KEY: str = ""
     ANTHROPIC_BASE_URL: str = ""  # Custom endpoint (e.g. Azure-hosted)
-    CLAUDE_MODEL: str = "claude-sonnet-4-5-20250929"  # Legacy: used if FAST/RESEARCH not set
-    CLAUDE_MODEL_FAST: str = "claude-haiku-4-5-20251001"  # Position review, market selection
-    CLAUDE_MODEL_RESEARCH: str = "claude-sonnet-4-5-20250929"  # Web research + trading
+    CLAUDE_MODEL: str = "claude-sonnet-4-5"  # Legacy: used if FAST/RESEARCH not set
+    CLAUDE_MODEL_FAST: str = "claude-haiku-4-5"  # Position review, market selection
+    CLAUDE_MODEL_RESEARCH: str = "claude-sonnet-4-5"  # Web research + trading
     CLAUDE_MAX_TOKENS: int = 4096
 
     # Polymarket (real backend only)

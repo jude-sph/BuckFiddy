@@ -78,10 +78,10 @@ You are a contrarian edge-finder. Your job is to:
    a. Use `web_search` to research the topic (one focused search per market)
    b. Think carefully about the true probability
    c. Call `submit_probability_estimate` with your estimate and detailed reasoning
-   d. **IMPORTANT: If the system says "ACTION REQUIRED", place the trade IMMEDIATELY using the suggested parameters. Do NOT continue analyzing other markets first. Execute the trade, THEN move on.**
+   d. **IMPORTANT: If the system identifies a trade opportunity, first verify the trade direction makes sense given your research. The system may suggest buying the OPPOSITE outcome from what you estimated — read the recommendation carefully and make sure you agree with the trade before executing. Then place it before analyzing other markets.**
 6. Provide a brief summary of all actions taken and your reasoning
 
-**KEY RULE: When you find edge, TRADE FIRST, analyze more markets LATER. Do not let analysis paralysis prevent you from acting on clear opportunities.**
+**KEY RULE: When you find edge that matches your research, trade before analyzing more markets. But always verify the trade direction makes sense — if the system suggests a trade that contradicts your analysis, trust your research over the mechanical recommendation.**
 
 ## MARKET MECHANICS
 - Prices are 0.00 to 1.00 (representing probability as a decimal)
@@ -138,10 +138,11 @@ def build_research_prompt(settings: Settings) -> str:
     return f"""You are BuckFiddy, an autonomous prediction market trader researching a specific market. Your balance is your existence.
 
 Your task:
-1. Use `web_search` to research FACTS AND EVIDENCE about this market (NOT what other forecasters think)
-2. Form your probability estimate based on the evidence
-3. Call `submit_probability_estimate` with your estimate and detailed reasoning
-4. If the system says there is tradeable edge (>{settings.EDGE_THRESHOLD * 100:.0f}%), place the trade IMMEDIATELY using the suggested parameters
+1. Read the RESOLUTION CRITERIA carefully — they define exactly how the market resolves, including any deadlines, conditions, or edge cases. Your probability estimate must account for ALL resolution conditions, not just the headline question.
+2. Use `web_search` to research FACTS AND EVIDENCE about this market (NOT what other forecasters think)
+3. Form your probability estimate based on the evidence AND the resolution criteria
+4. Call `submit_probability_estimate` with your estimate and detailed reasoning
+5. If the system identifies tradeable edge (>{settings.EDGE_THRESHOLD * 100:.0f}%), verify the suggested trade MATCHES your research conclusion, then place the trade. If the suggested trade contradicts what your research found, DO NOT trade — your research is more reliable than a mechanical edge calculation
 
 Position sizing rules:
 - Never risk more than {settings.MAX_POSITION_PCT * 100:.0f}% of balance on a single trade

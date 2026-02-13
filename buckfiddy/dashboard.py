@@ -216,7 +216,9 @@ def api_summary():
         "estimates": est_count["n"] if est_count else 0,
         "tradeable_edges": tradeable_count["n"] if tradeable_count else 0,
         "model_fast": _short_model(settings.CLAUDE_MODEL_FAST),
+        "model_fast_id": settings.CLAUDE_MODEL_FAST,
         "model_research": _short_model(settings.CLAUDE_MODEL_RESEARCH),
+        "model_research_id": settings.CLAUDE_MODEL_RESEARCH,
     }
 
 
@@ -361,7 +363,12 @@ def api_reset():
     for table in ["estimates", "trades", "orders", "positions", "cycle_log", "api_usage", "equity_snapshots"]:
         s.execute(f"DELETE FROM {table}")
     s.execute("UPDATE wallet SET balance = 100.0 WHERE id = 1")
+    s.execute("DELETE FROM sqlite_sequence")  # Reset autoincrement counters
     s.commit()
+    # Reset agent cycle counter so next run starts fresh
+    if agent:
+        agent.cycle_count = 0
+        agent.dispatcher.reset_cycle_counters()
     return {"status": "ok", "message": "All data cleared, balance reset to $100"}
 
 
@@ -369,10 +376,17 @@ def api_reset():
 def api_agent_status():
     running = agent is not None and agent.running
     settings = Settings()
+    a = agent
+    api_key = a.settings.ANTHROPIC_API_KEY if a else settings.ANTHROPIC_API_KEY
     return {
         "running": running,
-        "cycle": agent.cycle_count if agent else 0,
+        "cycle": a.cycle_count if a else 0,
         "backend": settings.TRADING_BACKEND,
+        "has_api_key": bool(api_key),
+        "cycle_type": a.current_cycle_type if a else "",
+        "phase": a.current_phase if a else "",
+        "full_interval": a.settings.FULL_CYCLE_INTERVAL_SECONDS if a else settings.FULL_CYCLE_INTERVAL_SECONDS,
+        "light_interval": a.settings.POSITION_CHECK_INTERVAL_SECONDS if a else settings.POSITION_CHECK_INTERVAL_SECONDS,
     }
 
 
@@ -415,6 +429,74 @@ def api_backend_switch(body: dict):
     return {"status": "ok", "backend": target}
 
 
+# Available models for the dropdowns
+AVAILABLE_MODELS = [
+    {"id": "claude-haiku-4-5", "label": "Haiku 4.5"},
+    {"id": "claude-sonnet-4-5", "label": "Sonnet 4.5"},
+    {"id": "claude-opus-4-6", "label": "Opus 4.6"},
+]
+
+
+@app.get("/api/models")
+def api_models():
+    settings = Settings()
+    return {
+        "available": AVAILABLE_MODELS,
+        "fast": settings.CLAUDE_MODEL_FAST,
+        "research": settings.CLAUDE_MODEL_RESEARCH,
+    }
+
+
+@app.post("/api/models/switch")
+def api_models_switch(body: dict):
+    if agent and agent.running:
+        return JSONResponse(
+            {"error": "Stop the agent before changing models"}, status_code=400
+        )
+
+    model_ids = {m["id"] for m in AVAILABLE_MODELS}
+    fast = body.get("fast")
+    research = body.get("research")
+
+    if fast and fast not in model_ids:
+        return JSONResponse({"error": f"Unknown model: {fast}"}, status_code=400)
+    if research and research not in model_ids:
+        return JSONResponse({"error": f"Unknown model: {research}"}, status_code=400)
+
+    # Update the agent's settings in memory
+    a = get_or_create_agent()
+    if fast:
+        a.settings.CLAUDE_MODEL_FAST = fast
+    if research:
+        a.settings.CLAUDE_MODEL_RESEARCH = research
+
+    return {
+        "status": "ok",
+        "fast": a.settings.CLAUDE_MODEL_FAST,
+        "research": a.settings.CLAUDE_MODEL_RESEARCH,
+    }
+
+
+@app.post("/api/timing/update")
+def api_timing_update(body: dict):
+    full = body.get("full_interval")
+    light = body.get("light_interval")
+
+    a = get_or_create_agent()
+    if full is not None:
+        val = max(60, int(full))  # Minimum 1 minute
+        a.settings.FULL_CYCLE_INTERVAL_SECONDS = val
+    if light is not None:
+        val = max(30, int(light))  # Minimum 30 seconds
+        a.settings.POSITION_CHECK_INTERVAL_SECONDS = val
+
+    return {
+        "status": "ok",
+        "full_interval": a.settings.FULL_CYCLE_INTERVAL_SECONDS,
+        "light_interval": a.settings.POSITION_CHECK_INTERVAL_SECONDS,
+    }
+
+
 _agent_lock = threading.Lock()
 
 
@@ -423,6 +505,11 @@ def api_agent_start():
     global agent_thread
     with _agent_lock:
         a = get_or_create_agent()
+        if not a.settings.ANTHROPIC_API_KEY:
+            return JSONResponse(
+                {"error": "No API key configured. Set BF_ANTHROPIC_API_KEY in your .env file."},
+                status_code=400,
+            )
         if a.running or (agent_thread and agent_thread.is_alive()):
             return {"status": "already_running", "cycle": a.cycle_count}
         agent_thread = threading.Thread(target=a.run, daemon=True, name="buckfiddy-agent")
@@ -443,6 +530,11 @@ def api_agent_single():
     global agent_thread
     with _agent_lock:
         a = get_or_create_agent()
+        if not a.settings.ANTHROPIC_API_KEY:
+            return JSONResponse(
+                {"error": "No API key configured. Set BF_ANTHROPIC_API_KEY in your .env file."},
+                status_code=400,
+            )
         if a.running or (agent_thread and agent_thread.is_alive()):
             return JSONResponse({"error": "Agent is already running"}, status_code=400)
         agent_thread = threading.Thread(target=a.run_single_cycle, daemon=True, name="buckfiddy-single")
@@ -500,6 +592,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div>
         <span id="status-text" class="text-sm font-semibold text-slate-400">Stopped</span>
         <span id="status-detail" class="text-xs text-slate-600 ml-3"></span>
+        <span id="phase-badge" class="hidden ml-2 px-2 py-0.5 rounded text-xs font-medium bg-purple-900/50 text-purple-300 border border-purple-800"></span>
       </div>
     </div>
     <div class="flex items-center gap-2">
@@ -522,7 +615,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <p class="text-sm text-slate-500 mt-1">Autonomous Polymarket Trading Agent
         <span id="backend-badge" class="ml-2 px-2 py-0.5 rounded text-xs font-medium bg-blue-900/50 text-blue-400 border border-blue-800">MOCK</span>
       </p>
-      <p id="model-config" class="text-xs text-slate-600 mt-1"></p>
+      <div class="flex items-center gap-3 mt-1 flex-wrap">
+        <span class="text-xs text-slate-600">Fast:</span>
+        <select id="model-fast-select" onchange="switchModel('fast', this.value)" class="px-2 py-0.5 text-xs text-slate-300 bg-slate-800 border border-slate-700 rounded cursor-pointer"></select>
+        <span class="text-xs text-slate-600">Research:</span>
+        <select id="model-research-select" onchange="switchModel('research', this.value)" class="px-2 py-0.5 text-xs text-slate-300 bg-slate-800 border border-slate-700 rounded cursor-pointer"></select>
+        <span class="text-slate-700 mx-1">|</span>
+        <span class="text-xs text-slate-600">Full cycle every</span>
+        <input id="timing-full" type="number" min="1" step="1" class="w-12 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateTiming()">
+        <span class="text-xs text-slate-600">min, check every</span>
+        <input id="timing-light" type="number" min="1" step="1" class="w-12 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateTiming()">
+        <span class="text-xs text-slate-600">min</span>
+      </div>
     </div>
   </div>
 
@@ -713,10 +817,9 @@ async function updateSummary() {
 
   $('last-update').textContent = 'Updated ' + new Date().toLocaleTimeString();
 
-  // Model config
-  if (d.model_fast || d.model_research) {
-    $('model-config').textContent = 'Fast: ' + (d.model_fast || '?') + ' | Research: ' + (d.model_research || '?');
-  }
+  // Sync model dropdowns with current values
+  if (d.model_fast_id) $('model-fast-select').value = d.model_fast_id;
+  if (d.model_research_id) $('model-research-select').value = d.model_research_id;
 }
 
 async function updateAgentStatus() {
@@ -725,14 +828,30 @@ async function updateAgentStatus() {
   const running = d.running;
   const banner = $('status-banner');
 
+  const phaseBadge = $('phase-badge');
   if (running) {
     banner.className = 'mb-6 rounded-xl px-5 py-3 flex items-center justify-between border transition-all duration-300 bg-green-950/40 border-green-800';
     $('status-dot').className = 'w-3 h-3 rounded-full bg-green-500 pulse shrink-0';
     $('status-text').textContent = 'AGENT RUNNING';
     $('status-text').className = 'text-sm font-bold text-green-400';
-    $('status-detail').textContent = 'Cycle ' + d.cycle + ' — API costs are accumulating';
+    const cycleLabel = d.cycle_type === 'full' ? 'Full Cycle' : d.cycle_type === 'light' ? 'Position Check' : 'Cycle';
+    $('status-detail').textContent = cycleLabel + ' ' + d.cycle;
     $('status-detail').className = 'text-xs text-green-600 ml-3';
     document.title = 'RUNNING — BuckFiddy';
+    // Phase badge
+    if (d.phase) {
+      phaseBadge.textContent = d.phase;
+      phaseBadge.classList.remove('hidden');
+      if (d.phase === 'Sleeping') {
+        phaseBadge.className = 'ml-2 px-2 py-0.5 rounded text-xs font-medium bg-slate-800 text-slate-400 border border-slate-700';
+      } else if (d.phase.startsWith('Research')) {
+        phaseBadge.className = 'ml-2 px-2 py-0.5 rounded text-xs font-medium bg-amber-900/50 text-amber-300 border border-amber-800';
+      } else {
+        phaseBadge.className = 'ml-2 px-2 py-0.5 rounded text-xs font-medium bg-purple-900/50 text-purple-300 border border-purple-800';
+      }
+    } else {
+      phaseBadge.classList.add('hidden');
+    }
   } else {
     banner.className = 'mb-6 rounded-xl px-5 py-3 flex items-center justify-between border transition-all duration-300 bg-slate-900/50 border-slate-800';
     $('status-dot').className = 'w-3 h-3 rounded-full bg-slate-600 shrink-0';
@@ -743,6 +862,25 @@ async function updateAgentStatus() {
     document.title = 'BuckFiddy Dashboard';
     $('btn-stop').disabled = false;
     $('btn-stop').textContent = 'Stop Agent';
+    phaseBadge.classList.add('hidden');
+  }
+
+  // API key warning
+  if (!d.has_api_key) {
+    banner.className = 'mb-6 rounded-xl px-5 py-3 flex items-center justify-between border transition-all duration-300 bg-red-950/40 border-red-800';
+    $('status-dot').className = 'w-3 h-3 rounded-full bg-red-500 shrink-0';
+    $('status-text').textContent = 'NO API KEY';
+    $('status-text').className = 'text-sm font-bold text-red-400';
+    $('status-detail').textContent = 'Set BF_ANTHROPIC_API_KEY in .env and restart the dashboard';
+    $('status-detail').className = 'text-xs text-red-600 ml-3';
+  }
+
+  // Sync timing inputs (convert seconds to minutes for display)
+  if (d.full_interval && !$('timing-full').matches(':focus')) {
+    $('timing-full').value = Math.round(d.full_interval / 60);
+  }
+  if (d.light_interval && !$('timing-light').matches(':focus')) {
+    $('timing-light').value = Math.round(d.light_interval / 60);
   }
 
   $('btn-start').classList.toggle('hidden', running);
@@ -761,6 +899,8 @@ async function updateAgentStatus() {
   }
   $('backend-select').value = be;
   $('backend-select').disabled = running;
+  $('model-fast-select').disabled = running;
+  $('model-research-select').disabled = running;
 }
 
 async function updateEquityChart() {
@@ -974,13 +1114,56 @@ async function switchBackend(target) {
   } else {
     const d = await r.json();
     alert(d.error || 'Switch failed');
-    updateAgentStatus();  // Reset select to actual value
+    updateAgentStatus();
+  }
+}
+
+async function switchModel(role, modelId) {
+  const body = {};
+  body[role] = modelId;
+  const r = await fetch('/api/models/switch', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  if (!r.ok) {
+    const d = await r.json();
+    alert(d.error || 'Model switch failed');
+    loadModels();  // Reset dropdowns
+  }
+}
+
+async function updateTiming() {
+  const fullMin = parseInt($('timing-full').value) || 120;
+  const lightMin = parseInt($('timing-light').value) || 30;
+  await fetch('/api/timing/update', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ full_interval: fullMin * 60, light_interval: lightMin * 60 })
+  });
+}
+
+async function loadModels() {
+  const d = await fetchJson('/api/models');
+  if (!d) return;
+  for (const [role, selectId] of [['fast', 'model-fast-select'], ['research', 'model-research-select']]) {
+    const sel = $(selectId);
+    if (!sel.options.length) {
+      d.available.forEach(m => {
+        const opt = document.createElement('option');
+        opt.value = m.id;
+        opt.textContent = m.label;
+        sel.appendChild(opt);
+      });
+    }
+    sel.value = d[role];
   }
 }
 
 async function agentStart() {
   const r = await fetch('/api/agent/start', { method: 'POST' });
-  if (r.ok) updateAgentStatus();
+  if (r.ok) { updateAgentStatus(); }
+  else { const d = await r.json(); alert(d.error || 'Start failed'); }
 }
 
 async function agentStop() {
@@ -994,7 +1177,8 @@ async function agentStop() {
 
 async function agentSingle() {
   const r = await fetch('/api/agent/single', { method: 'POST' });
-  if (r.ok) updateAgentStatus();
+  if (r.ok) { updateAgentStatus(); }
+  else { const d = await r.json(); alert(d.error || 'Start failed'); }
 }
 
 async function resetData() {
@@ -1040,8 +1224,10 @@ async function updateLogs() {
 }
 
 refreshAll();
+loadModels();
 updateLogs();
 setInterval(refreshAll, 15000);
+setInterval(updateAgentStatus, 3000);
 setInterval(updateLogs, 3000);
 </script>
 </body>

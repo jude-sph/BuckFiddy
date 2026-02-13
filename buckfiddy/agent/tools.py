@@ -262,6 +262,17 @@ class ToolDispatcher:
         self.store = StateStore(settings.DB_PATH)
         self._market_end_dates: dict[str, str] = {}  # market_id -> end_date
         self._new_estimates_this_cycle: int = 0  # Counter for new market estimates
+        self._last_estimate: dict[str, dict] = {}  # market_id -> last estimate info
+
+    def _find_opposite_token(self, token_id: str, market_id: str) -> tuple[str, str] | None:
+        """Find the opposite token for a binary market.
+        Returns (opposite_token_id, opposite_outcome) or None."""
+        if not hasattr(self.backend, '_token_meta'):
+            return None
+        for tid, meta in self.backend._token_meta.items():
+            if meta.get("market_id") == market_id and tid != token_id:
+                return (tid, meta.get("outcome", "unknown"))
+        return None
 
     def reset_cycle_counters(self):
         """Reset per-cycle counters. Call at the start of each cycle."""
@@ -393,6 +404,14 @@ class ToolDispatcher:
         estimate_id = cursor.lastrowid
         self.store.commit()
 
+        # Cache estimate for soft validation in order handlers
+        self._last_estimate[market_id] = {
+            "token_id": token_id,
+            "outcome": outcome,
+            "estimate": estimate,
+            "edge": edge,
+        }
+
         logger.info(
             f"Estimate: {outcome} @ {estimate:.3f} vs market {midpoint:.3f} "
             f"(edge: {edge:+.3f}, tradeable: {tradeable})"
@@ -449,25 +468,50 @@ class ToolDispatcher:
             )
         elif tradeable and edge > 0:
             recommendation = (
-                f"ACTION REQUIRED — PLACE TRADE NOW. BUY {outcome} shares. "
+                f"TRADE OPPORTUNITY — BUY \"{outcome}\" shares. "
+                f"Market question: \"{market_question}\"\n"
                 f"You estimate {estimate:.3f}, market is at {midpoint:.3f}. "
                 f"Edge: +{abs_edge:.1%}. "
                 f"Suggested: place_market_order with token_id={token_id}, "
                 f"side=BUY, amount=${suggested_amount:.2f} "
-                f"({suggested_pct:.0%} of ${balance:.2f} balance). "
-                f"Do this BEFORE analyzing other markets."
+                f"({suggested_pct:.0%} of ${balance:.2f} balance), "
+                f"estimate_id={estimate_id}.\n"
+                f"Verify this matches your research before placing the trade."
             )
         elif tradeable and edge < 0:
-            recommendation = (
-                f"ACTION REQUIRED — PLACE TRADE NOW. The market OVERVALUES "
-                f"{outcome} at {midpoint:.3f} vs your {estimate:.3f}. "
-                f"Edge: {abs_edge:.1%}. You should BUY the OPPOSITE outcome. "
-                f"Look up the other token_id from scan_markets results for this "
-                f"market and call place_market_order with side=BUY, "
-                f"amount=${suggested_amount:.2f} "
-                f"({suggested_pct:.0%} of ${balance:.2f} balance). "
-                f"Do this BEFORE analyzing other markets."
-            )
+            opposite = self._find_opposite_token(token_id, market_id)
+            if opposite:
+                opp_token_id, opp_outcome = opposite
+                recommendation = (
+                    f"TRADE OPPORTUNITY — BUY \"{opp_outcome}\" shares. "
+                    f"Market question: \"{market_question}\"\n"
+                    f"You estimated {outcome} at {estimate:.3f}, but the market "
+                    f"prices {outcome} even higher at {midpoint:.3f}. "
+                    f"Edge: {abs_edge:.1%} on the opposite side.\n"
+                    f"This means BETTING that the answer to "
+                    f"\"{market_question}\" is \"{opp_outcome}\".\n"
+                    f"Suggested: place_market_order with token_id={opp_token_id}, "
+                    f"side=BUY, amount=${suggested_amount:.2f} "
+                    f"({suggested_pct:.0%} of ${balance:.2f} balance), "
+                    f"estimate_id={estimate_id}.\n"
+                    f"*** SANITY CHECK: Your research argued {outcome} is likely "
+                    f"({estimate:.0%}). Buying \"{opp_outcome}\" means betting "
+                    f"AGAINST that conclusion. Only proceed if you genuinely "
+                    f"believe the market is overpricing {outcome}, not just "
+                    f"because this system told you to. If this contradicts your "
+                    f"research, DO NOT TRADE. ***"
+                )
+            else:
+                recommendation = (
+                    f"POSSIBLE EDGE on the opposite side of this market, but "
+                    f"the opposite token could not be resolved. "
+                    f"Market question: \"{market_question}\". "
+                    f"You estimated {outcome} at {estimate:.3f}, market is at "
+                    f"{midpoint:.3f} (edge: {abs_edge:.1%}). "
+                    f"If you want to trade the opposite, look up the other "
+                    f"token_id from scan_markets results. "
+                    f"But first: does betting AGAINST {outcome} match your analysis?"
+                )
         else:
             recommendation = (
                 f"No tradeable edge — your estimate {estimate:.3f} is close to "
@@ -506,13 +550,28 @@ class ToolDispatcher:
         return result.model_dump()
 
     def _handle_place_market_order(self, input: dict) -> dict:
+        token_id = input["token_id"]
         result = self.backend.place_market_order(
-            token_id=input["token_id"],
+            token_id=token_id,
             side=input["side"],
             amount=input["amount"],
             estimate_id=input.get("estimate_id"),
         )
-        return result.model_dump()
+        result_dict = result.model_dump()
+
+        # Soft validation: warn if buying a token opposite to a high-confidence estimate
+        if input["side"] == "BUY" and result.success:
+            meta = self.backend._get_token_meta(token_id) if hasattr(self.backend, '_get_token_meta') else {}
+            mid = meta.get("market_id")
+            if mid and mid in self._last_estimate:
+                last = self._last_estimate[mid]
+                if last["token_id"] != token_id and last["estimate"] > 0.5:
+                    result_dict["warning"] = (
+                        f"NOTE: You bought the opposite of what you estimated. "
+                        f"You estimated {last['outcome']} at {last['estimate']:.0%} "
+                        f"but bought the other side. Make sure this was intentional."
+                    )
+        return result_dict
 
     def _handle_cancel_order(self, input: dict) -> dict:
         result = self.backend.cancel_order(input["order_id"])

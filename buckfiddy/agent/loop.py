@@ -94,6 +94,8 @@ class AgentLoop:
         self.cycle_count = 0
         self._stop_event = threading.Event()
         self.running = False
+        self.current_cycle_type = ""   # "full" | "light" | ""
+        self.current_phase = ""        # e.g. "Position Review", "Market Selection", "Research"
 
     def request_stop(self):
         """Signal the agent loop to stop after the current cycle."""
@@ -104,7 +106,6 @@ class AgentLoop:
         logger.info("BuckFiddy agent loop starting")
         self.running = True
         self._stop_event.clear()
-        sleep_seconds = self.settings.POSITION_CHECK_INTERVAL_SECONDS
         try:
             while not self._stop_event.is_set():
                 try:
@@ -118,6 +119,8 @@ class AgentLoop:
                 if self._stop_event.is_set():
                     break
 
+                self.current_phase = "Sleeping"
+                sleep_seconds = self.settings.POSITION_CHECK_INTERVAL_SECONDS
                 logger.info(f"Sleeping {sleep_seconds}s until next cycle...")
                 for _ in range(sleep_seconds):
                     if self._stop_event.is_set():
@@ -125,24 +128,29 @@ class AgentLoop:
                     time.sleep(1)
         finally:
             self.running = False
+            self.current_cycle_type = ""
+            self.current_phase = ""
             logger.info("Agent loop stopped")
 
     def run_single_cycle(self):
-        """Run exactly one cycle — useful for testing."""
+        """Run exactly one full cycle (all phases) — useful for testing."""
         self.running = True
         try:
-            self._run_cycle()
+            self._run_cycle(force_full=True)
         finally:
+            self.current_cycle_type = ""
+            self.current_phase = ""
             self.running = False
 
     # ── Cycle orchestration ──────────────────────────────────────────
 
-    def _run_cycle(self):
+    def _run_cycle(self, force_full: bool = False):
         self.cycle_count += 1
         self.dispatcher.reset_cycle_counters()
-        is_full = self._is_full_cycle()
-        cycle_type = "full" if is_full else "light"
-        logger.info(f"=== Cycle {self.cycle_count} ({cycle_type}) starting ===")
+        is_full = force_full or self._is_full_cycle()
+        self.current_cycle_type = "full" if is_full else "light"
+        self.current_phase = "Starting"
+        logger.info(f"=== Cycle {self.cycle_count} ({self.current_cycle_type}) starting ===")
 
         # Hard stop loss check (outside Claude's control)
         stop_loss_results = check_stop_losses(
@@ -177,6 +185,7 @@ class AgentLoop:
         summary_parts = []
 
         # Phase 1: Position review (Haiku, fresh conversation)
+        self.current_phase = "Position Review"
         wallet = self.backend.get_wallet_state()
         if wallet.positions:
             logger.info(f"Phase 1: Reviewing {len(wallet.positions)} positions")
@@ -186,6 +195,7 @@ class AgentLoop:
             summary_parts.append("[Position Review] No open positions.")
 
         # Phase 2: Market scan + selection (Haiku, fresh conversation)
+        self.current_phase = "Market Selection"
         logger.info("Phase 2: Scanning and selecting markets")
         markets = self.scanner.scan(
             max_results=self.settings.MAX_MARKETS_PER_SCAN
@@ -212,6 +222,7 @@ class AgentLoop:
 
         # Phase 3: Research + trade per market (Sonnet/Opus, fresh conversation each)
         for i, market_info in enumerate(selected[:2]):
+            self.current_phase = f"Research ({i+1}/{len(selected[:2])})"
             logger.info(
                 f"Phase 3.{i+1}: Researching '{market_info.get('question', '?')[:60]}'"
             )
@@ -223,6 +234,7 @@ class AgentLoop:
         return "\n\n".join(summary_parts)
 
     def _run_lightweight_cycle(self, usage: CycleUsage) -> str:
+        self.current_phase = "Position Review"
         wallet = self.backend.get_wallet_state()
         if not wallet.positions:
             return "Lightweight cycle — no open positions to review."
@@ -343,7 +355,7 @@ class AgentLoop:
                 result.append({
                     "market_id": m.market_id,
                     "question": m.question,
-                    "description": m.description[:500],
+                    "description": m.description,  # Full text — contains resolution criteria
                     "outcomes": m.outcomes,
                     "clob_token_ids": m.clob_token_ids,
                     "end_date": m.end_date,
@@ -373,7 +385,7 @@ class AgentLoop:
             f"Research this market and decide whether to trade:\n\n"
             f"Market ID: {market_info['market_id']}\n"
             f"Question: \"{market_info['question']}\"\n"
-            f"Description: {market_info['description']}\n"
+            f"Resolution criteria: {market_info['description']}\n"
             f"Outcomes: {market_info['outcomes']}\n"
             f"Token IDs: {market_info['clob_token_ids']}\n"
             f"End date: {market_info['end_date']}\n\n"
@@ -491,27 +503,33 @@ class AgentLoop:
         max_retries: int = 5,
     ):
         """Make an API call with exponential backoff and prompt caching."""
-        # Format system prompt with cache control for prompt caching
-        system = [
-            {
-                "type": "text",
-                "text": system_prompt,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ]
+        # Only use cache_control with the native Anthropic API (not custom proxies)
+        use_caching = not self.settings.ANTHROPIC_BASE_URL
 
-        # Add cache_control to last user-defined tool (not server tools)
+        if use_caching:
+            system = [
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+        else:
+            system = system_prompt
+
+        # Prepare tools
         call_tools = tools if tools else None
         if call_tools:
             call_tools = list(call_tools)  # Copy to avoid mutation
-            # Find the last user-defined tool (has input_schema)
-            for i in range(len(call_tools) - 1, -1, -1):
-                if "input_schema" in call_tools[i]:
-                    call_tools[i] = {
-                        **call_tools[i],
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                    break
+            if use_caching:
+                # Add cache_control to last user-defined tool
+                for i in range(len(call_tools) - 1, -1, -1):
+                    if "input_schema" in call_tools[i]:
+                        call_tools[i] = {
+                            **call_tools[i],
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                        break
 
         for attempt in range(max_retries):
             try:
@@ -533,6 +551,9 @@ class AgentLoop:
                 time.sleep(wait)
             except anthropic.APIError as e:
                 logger.error(f"Claude API error: {e}")
+                return None
+            except Exception as e:
+                logger.error(f"Unexpected API error: {type(e).__name__}: {e}")
                 return None
 
         logger.error("Rate limit retries exhausted")
