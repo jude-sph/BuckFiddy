@@ -102,30 +102,58 @@ class AgentLoop:
         self._stop_event.set()
 
     def run(self):
-        """Main loop — runs indefinitely until stopped."""
+        """Main loop — runs check and research cycles on independent schedules."""
         logger.info("BuckFiddy agent loop starting")
         self.running = True
         self._stop_event.clear()
+
+        now = time.monotonic()
+        next_check = now  # Run a check immediately on start
+        next_research = now  # Run research immediately on start
+
         try:
             while not self._stop_event.is_set():
-                try:
-                    self._run_cycle()
-                except KeyboardInterrupt:
-                    logger.info("Shutting down gracefully")
-                    break
-                except Exception as e:
-                    logger.error(f"Cycle {self.cycle_count} failed: {e}", exc_info=True)
+                now = time.monotonic()
+                ran_something = False
+
+                # Check cycle is due
+                if now >= next_check:
+                    try:
+                        self._run_cycle(force_check=True)
+                        ran_something = True
+                    except KeyboardInterrupt:
+                        logger.info("Shutting down gracefully")
+                        break
+                    except Exception as e:
+                        logger.error(f"Check cycle failed: {e}", exc_info=True)
+                    next_check = time.monotonic() + self.settings.POSITION_CHECK_INTERVAL_SECONDS
 
                 if self._stop_event.is_set():
                     break
 
-                self.current_phase = "Sleeping"
-                sleep_seconds = self.settings.POSITION_CHECK_INTERVAL_SECONDS
-                logger.info(f"Sleeping {sleep_seconds}s until next cycle...")
-                for _ in range(sleep_seconds):
-                    if self._stop_event.is_set():
+                # Research cycle is due
+                if now >= next_research:
+                    try:
+                        self._run_cycle(force_full=True)
+                        ran_something = True
+                    except KeyboardInterrupt:
+                        logger.info("Shutting down gracefully")
                         break
-                    time.sleep(1)
+                    except Exception as e:
+                        logger.error(f"Research cycle failed: {e}", exc_info=True)
+                    next_research = time.monotonic() + self.settings.FULL_CYCLE_INTERVAL_SECONDS
+
+                if not ran_something or self._stop_event.is_set():
+                    # Sleep until next event
+                    self.current_phase = "Sleeping"
+                    wake_at = min(next_check, next_research)
+                    sleep_for = max(0, wake_at - time.monotonic())
+                    if sleep_for > 0:
+                        logger.info(f"Sleeping {sleep_for:.0f}s until next cycle...")
+                    while time.monotonic() < wake_at:
+                        if self._stop_event.is_set():
+                            break
+                        time.sleep(1)
         finally:
             self.running = False
             self.current_cycle_type = ""
@@ -157,10 +185,7 @@ class AgentLoop:
     def _run_cycle(self, force_full: bool = False, force_check: bool = False):
         self.cycle_count += 1
         self.dispatcher.reset_cycle_counters()
-        if force_check:
-            is_full = False
-        else:
-            is_full = force_full or self._is_full_cycle()
+        is_full = force_full and not force_check
         self.current_cycle_type = "research" if is_full else "check"
         self.current_phase = "Starting"
         logger.info(f"=== Cycle {self.cycle_count} ({self.current_cycle_type}) starting ===")
@@ -180,36 +205,19 @@ class AgentLoop:
         summary = ""
         try:
             if is_full:
-                summary = self._run_full_cycle(usage)
+                summary = self._run_research_cycle(usage)
             else:
-                summary = self._run_lightweight_cycle(usage)
+                summary = self._run_check_cycle(usage)
         finally:
             self._log_cycle(summary, len(stop_loss_results), usage)
 
-    def _is_full_cycle(self) -> bool:
-        if self.cycle_count <= 1:
-            return True  # Always do a full first cycle
-        full_interval = self.settings.FULL_CYCLE_INTERVAL_SECONDS
-        light_interval = self.settings.POSITION_CHECK_INTERVAL_SECONDS
-        full_every_n = max(1, full_interval // light_interval)
-        return (self.cycle_count - 1) % full_every_n == 0
-
-    def _run_full_cycle(self, usage: CycleUsage) -> str:
+    def _run_research_cycle(self, usage: CycleUsage) -> str:
         summary_parts = []
 
-        # Phase 1: Position review (Haiku, fresh conversation)
-        self.current_phase = "Position Review"
-        wallet = self.backend.get_wallet_state()
-        if wallet.positions:
-            logger.info(f"Phase 1: Reviewing {len(wallet.positions)} positions")
-            phase_summary = self._phase_position_review(wallet, usage)
-            summary_parts.append(f"[Position Review]\n{phase_summary}")
-        else:
-            summary_parts.append("[Position Review] No open positions.")
-
-        # Phase 2: Market scan + selection (Haiku, fresh conversation)
+        # Phase 1: Market scan + selection (Haiku, fresh conversation)
         self.current_phase = "Market Selection"
-        logger.info("Phase 2: Scanning and selecting markets")
+        logger.info("Scanning and selecting markets")
+        wallet = self.backend.get_wallet_state()
         markets = self.scanner.scan(
             max_results=self.settings.MAX_MARKETS_PER_SCAN
         )
@@ -226,14 +234,12 @@ class AgentLoop:
                 )
                 self.dispatcher._market_end_dates[m.market_id] = m.end_date
 
-        # Refresh wallet after position review may have closed positions
-        wallet = self.backend.get_wallet_state()
         selected = self._phase_market_selection(markets, wallet, usage)
         summary_parts.append(
             f"[Market Selection] Selected {len(selected)} market(s) to research."
         )
 
-        # Phase 3: Research + trade per market (Sonnet/Opus, fresh conversation each)
+        # Phase 2: Research + trade per market (Sonnet/Opus, fresh conversation each)
         max_research = self.settings.MAX_NEW_ESTIMATES_PER_CYCLE
         for i, market_info in enumerate(selected[:max_research]):
             self.current_phase = f"Research ({i+1}/{len(selected[:max_research])})"
@@ -247,13 +253,13 @@ class AgentLoop:
 
         return "\n\n".join(summary_parts)
 
-    def _run_lightweight_cycle(self, usage: CycleUsage) -> str:
+    def _run_check_cycle(self, usage: CycleUsage) -> str:
         self.current_phase = "Position Review"
         wallet = self.backend.get_wallet_state()
         if not wallet.positions:
-            return "Lightweight cycle — no open positions to review."
+            return "Check cycle — no open positions to review."
         logger.info(
-            f"Lightweight cycle: reviewing {len(wallet.positions)} positions"
+            f"Check cycle: reviewing {len(wallet.positions)} positions"
         )
         return self._phase_position_review(wallet, usage)
 
