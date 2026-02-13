@@ -545,12 +545,17 @@ def api_agent_single():
 @app.get("/api/logs")
 def api_logs(after: int = 0):
     """Return log lines. Client passes `after=N` to get only new lines."""
-    lines = list(LOG_BUFFER)
     current = _log_counter
+    # If client is caught up, return nothing
+    if after > 0 and after >= current:
+        return {"lines": [], "cursor": current}
     # If client has a cursor, only send new lines
-    if after > 0 and after < current:
+    if after > 0:
         new_count = current - after
+        lines = list(LOG_BUFFER)
         lines = lines[-new_count:] if new_count < len(lines) else lines
+    else:
+        lines = list(LOG_BUFFER)
     return {"lines": lines, "cursor": current}
 
 
