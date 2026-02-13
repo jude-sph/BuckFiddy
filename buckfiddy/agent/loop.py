@@ -98,6 +98,7 @@ class AgentLoop:
         self.current_phase = ""        # e.g. "Position Review", "Market Selection", "Research"
         self._next_check_at: float = 0  # monotonic timestamp
         self._next_research_at: float = 0  # monotonic timestamp
+        self._recently_researched: dict[str, float] = {}  # market_id → monotonic timestamp
 
     @property
     def next_check_secs(self) -> int:
@@ -250,7 +251,34 @@ class AgentLoop:
                 )
                 self.dispatcher._market_end_dates[m.market_id] = m.end_date
 
-        selected = self._phase_market_selection(markets, wallet, usage)
+        # Filter out markets we already hold or recently researched
+        held_market_ids = {p.market_id for p in wallet.positions}
+        now = time.monotonic()
+        cooldown = self.settings.MARKET_COOLDOWN_SECONDS
+        # Purge expired cooldowns
+        self._recently_researched = {
+            mid: ts for mid, ts in self._recently_researched.items()
+            if now - ts < cooldown
+        }
+        cooled_market_ids = set(self._recently_researched.keys())
+
+        excluded = held_market_ids | cooled_market_ids
+        eligible_markets = [m for m in markets if m.market_id not in excluded]
+
+        if excluded:
+            logger.info(
+                f"Filtered {len(markets) - len(eligible_markets)} markets "
+                f"({len(held_market_ids)} held, "
+                f"{len(cooled_market_ids & {m.market_id for m in markets})} on cooldown)"
+            )
+
+        if not eligible_markets:
+            summary_parts.append(
+                "[Market Scan] All scanned markets are held or on cooldown."
+            )
+            return "\n\n".join(summary_parts)
+
+        selected = self._phase_market_selection(eligible_markets, wallet, usage)
         summary_parts.append(
             f"[Market Selection] Selected {len(selected)} market(s) to research."
         )
@@ -264,6 +292,12 @@ class AgentLoop:
             )
             phase_summary = self._phase_research_trade(market_info, wallet, usage)
             summary_parts.append(f"[Research] {phase_summary}")
+
+            # Record this market as recently researched
+            mid = market_info.get("market_id")
+            if mid:
+                self._recently_researched[mid] = time.monotonic()
+
             # Refresh wallet after each trade
             wallet = self.backend.get_wallet_state()
 
@@ -331,19 +365,16 @@ class AgentLoop:
         model = self.settings.CLAUDE_MODEL_FAST
         system = build_market_selection_prompt(self.settings)
 
-        # Build market list for Claude
+        # Build market list for Claude (pre-filtered: no held or cooldown markets)
         lines = [
             f"Your balance: ${wallet.balance:.2f} | "
             f"Open positions: {len(wallet.positions)}\n",
             "Available markets:\n",
         ]
-        # Track which markets we already hold positions in
-        held_market_ids = {p.market_id for p in wallet.positions}
 
         for m in markets:
-            held_tag = " [YOU HOLD A POSITION]" if m.market_id in held_market_ids else ""
             lines.append(
-                f"- Market ID: {m.market_id}{held_tag}\n"
+                f"- Market ID: {m.market_id}\n"
                 f"  Question: \"{m.question}\"\n"
                 f"  Description: {m.description[:300]}\n"
                 f"  Outcomes: {m.outcomes}\n"
@@ -354,8 +385,8 @@ class AgentLoop:
 
         lines.append(
             "\nPick 1-2 markets where you have the strongest knowledge or "
-            "intuition. Skip markets you already hold and markets you know "
-            "nothing about. Return your selection as a JSON array."
+            "intuition. Skip markets you know nothing about. "
+            "Return your selection as a JSON array."
         )
 
         messages = [{"role": "user", "content": "\n".join(lines)}]

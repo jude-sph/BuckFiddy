@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     MIN_MARKET_LIQUIDITY: float = 5000.0
     MIN_MARKET_VOLUME: float = 10000.0
     MAX_MARKETS_PER_SCAN: int = 5
+    MARKET_COOLDOWN_SECONDS: int = 14400  # 4 hours — skip recently researched markets
 
     # Persistence
     DB_PATH: str = "data/buckfiddy.db"

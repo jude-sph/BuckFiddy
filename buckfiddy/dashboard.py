@@ -367,10 +367,11 @@ def api_reset():
     s.execute("UPDATE wallet SET balance = 100.0 WHERE id = 1")
     s.execute("DELETE FROM sqlite_sequence")  # Reset autoincrement counters
     s.commit()
-    # Reset agent cycle counter so next run starts fresh
+    # Reset agent cycle counter and cooldowns so next run starts fresh
     if agent:
         agent.cycle_count = 0
         agent.dispatcher.reset_cycle_counters()
+        agent._recently_researched.clear()
     return {"status": "ok", "message": "All data cleared, balance reset to $100"}
 
 
@@ -391,6 +392,7 @@ def api_agent_status():
         "light_interval": a.settings.POSITION_CHECK_INTERVAL_SECONDS if a else settings.POSITION_CHECK_INTERVAL_SECONDS,
         "markets_per_cycle": a.settings.MAX_NEW_ESTIMATES_PER_CYCLE if a else settings.MAX_NEW_ESTIMATES_PER_CYCLE,
         "edge_threshold": a.settings.EDGE_THRESHOLD if a else settings.EDGE_THRESHOLD,
+        "market_cooldown": (a.settings.MARKET_COOLDOWN_SECONDS if a else settings.MARKET_COOLDOWN_SECONDS) // 60,
         "next_check_secs": a.next_check_secs if a else 0,
         "next_research_secs": a.next_research_secs if a else 0,
     }
@@ -489,6 +491,7 @@ def api_timing_update(body: dict):
     light = body.get("light_interval")
     markets = body.get("markets_per_cycle")
     edge = body.get("edge_threshold")
+    cooldown = body.get("market_cooldown")
 
     a = get_or_create_agent()
     if full is not None:
@@ -503,6 +506,9 @@ def api_timing_update(body: dict):
     if edge is not None:
         val = max(0.01, min(0.50, float(edge)))  # 1-50%
         a.settings.EDGE_THRESHOLD = val
+    if cooldown is not None:
+        val = max(0, int(cooldown))  # seconds
+        a.settings.MARKET_COOLDOWN_SECONDS = val
 
     return {
         "status": "ok",
@@ -510,6 +516,7 @@ def api_timing_update(body: dict):
         "light_interval": a.settings.POSITION_CHECK_INTERVAL_SECONDS,
         "markets_per_cycle": a.settings.MAX_NEW_ESTIMATES_PER_CYCLE,
         "edge_threshold": a.settings.EDGE_THRESHOLD,
+        "market_cooldown": a.settings.MARKET_COOLDOWN_SECONDS // 60,
     }
 
 
@@ -671,7 +678,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <input id="timing-markets" type="number" min="1" max="5" step="1" class="w-12 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateTiming()">
         <span class="text-xs text-slate-600">markets/cycle, edge</span>
         <input id="timing-edge" type="number" min="1" max="50" step="1" class="w-12 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateTiming()">
-        <span class="text-xs text-slate-600">%</span>
+        <span class="text-xs text-slate-600">%, cooldown</span>
+        <input id="timing-cooldown" type="number" min="0" max="1440" step="30" class="w-14 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateTiming()">
+        <span class="text-xs text-slate-600">min</span>
       </div>
     </div>
   </div>
@@ -946,6 +955,9 @@ async function updateAgentStatus() {
   if (d.edge_threshold && !$('timing-edge').matches(':focus')) {
     $('timing-edge').value = Math.round(d.edge_threshold * 100);
   }
+  if (d.market_cooldown != null && !$('timing-cooldown').matches(':focus')) {
+    $('timing-cooldown').value = d.market_cooldown;
+  }
 
   $('btn-start').classList.toggle('hidden', running);
   $('btn-single-check').classList.toggle('hidden', running);
@@ -1203,10 +1215,11 @@ async function updateTiming() {
   const lightMin = parseInt($('timing-light').value) || 30;
   const markets = parseInt($('timing-markets').value) || 2;
   const edgePct = parseInt($('timing-edge').value) || 8;
+  const cooldownMin = parseInt($('timing-cooldown').value) || 0;
   await fetch('/api/timing/update', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ full_interval: fullMin * 60, light_interval: lightMin * 60, markets_per_cycle: markets, edge_threshold: edgePct / 100 })
+    body: JSON.stringify({ full_interval: fullMin * 60, light_interval: lightMin * 60, markets_per_cycle: markets, edge_threshold: edgePct / 100, market_cooldown: cooldownMin * 60 })
   });
 }
 
