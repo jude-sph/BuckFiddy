@@ -133,7 +133,7 @@ class AgentLoop:
             logger.info("Agent loop stopped")
 
     def run_single_cycle(self):
-        """Run exactly one full cycle (all phases) — useful for testing."""
+        """Run exactly one research cycle (all phases) — useful for testing."""
         self.running = True
         try:
             self._run_cycle(force_full=True)
@@ -142,13 +142,26 @@ class AgentLoop:
             self.current_phase = ""
             self.running = False
 
+    def run_single_check(self):
+        """Run exactly one check cycle (position review only)."""
+        self.running = True
+        try:
+            self._run_cycle(force_full=False, force_check=True)
+        finally:
+            self.current_cycle_type = ""
+            self.current_phase = ""
+            self.running = False
+
     # ── Cycle orchestration ──────────────────────────────────────────
 
-    def _run_cycle(self, force_full: bool = False):
+    def _run_cycle(self, force_full: bool = False, force_check: bool = False):
         self.cycle_count += 1
         self.dispatcher.reset_cycle_counters()
-        is_full = force_full or self._is_full_cycle()
-        self.current_cycle_type = "full" if is_full else "light"
+        if force_check:
+            is_full = False
+        else:
+            is_full = force_full or self._is_full_cycle()
+        self.current_cycle_type = "research" if is_full else "check"
         self.current_phase = "Starting"
         logger.info(f"=== Cycle {self.cycle_count} ({self.current_cycle_type}) starting ===")
 

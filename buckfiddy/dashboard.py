@@ -550,6 +550,23 @@ def api_agent_single():
     return {"status": "started_single"}
 
 
+@app.post("/api/agent/single-check")
+def api_agent_single_check():
+    global agent_thread
+    with _agent_lock:
+        a = get_or_create_agent()
+        if not a.settings.ANTHROPIC_API_KEY:
+            return JSONResponse(
+                {"error": "No API key configured. Set BF_ANTHROPIC_API_KEY in your .env file."},
+                status_code=400,
+            )
+        if a.running or (agent_thread and agent_thread.is_alive()):
+            return JSONResponse({"error": "Agent is already running"}, status_code=400)
+        agent_thread = threading.Thread(target=a.run_single_check, daemon=True, name="buckfiddy-check")
+        agent_thread.start()
+    return {"status": "started_check"}
+
+
 @app.get("/api/logs")
 def api_logs(after: int = 0):
     """Return log lines. Client passes `after=N` to get only new lines."""
@@ -611,7 +628,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="flex items-center gap-2">
       <span id="last-update" class="text-xs text-slate-600 mr-2"></span>
       <button id="btn-start" onclick="agentStart()" class="px-4 py-2 text-sm font-medium text-green-400 border border-green-900 rounded-lg hover:bg-green-900/30 transition-colors">Start Agent</button>
-      <button id="btn-single" onclick="agentSingle()" class="px-4 py-2 text-sm font-medium text-blue-400 border border-blue-900 rounded-lg hover:bg-blue-900/30 transition-colors">Run 1 Cycle</button>
+      <button id="btn-single-check" onclick="agentSingleCheck()" class="px-4 py-2 text-sm font-medium text-purple-400 border border-purple-900 rounded-lg hover:bg-purple-900/30 transition-colors">Run Check</button>
+      <button id="btn-single" onclick="agentSingle()" class="px-4 py-2 text-sm font-medium text-blue-400 border border-blue-900 rounded-lg hover:bg-blue-900/30 transition-colors">Run Research</button>
       <button id="btn-stop" onclick="agentStop()" class="px-4 py-2 text-sm font-medium text-amber-400 border border-amber-900 rounded-lg hover:bg-amber-900/30 transition-colors hidden">Stop Agent</button>
       <select id="backend-select" onchange="switchBackend(this.value)" class="px-3 py-2 text-sm font-medium text-slate-300 bg-slate-800 border border-slate-700 rounded-lg cursor-pointer">
         <option value="mock">Mock Trading</option>
@@ -634,9 +652,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <span class="text-xs text-slate-600">Research:</span>
         <select id="model-research-select" onchange="switchModel('research', this.value)" class="px-2 py-0.5 text-xs text-slate-300 bg-slate-800 border border-slate-700 rounded cursor-pointer"></select>
         <span class="text-slate-700 mx-1">|</span>
-        <span class="text-xs text-slate-600">Full cycle every</span>
+        <span class="text-xs text-slate-600">Research every</span>
         <input id="timing-full" type="number" min="1" step="1" class="w-12 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateTiming()">
-        <span class="text-xs text-slate-600">min, check every</span>
+        <span class="text-xs text-slate-600">min, checks every</span>
         <input id="timing-light" type="number" min="1" step="1" class="w-12 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateTiming()">
         <span class="text-xs text-slate-600">min</span>
         <span class="text-slate-700 mx-1">|</span>
@@ -851,7 +869,7 @@ async function updateAgentStatus() {
     $('status-dot').className = 'w-3 h-3 rounded-full bg-green-500 pulse shrink-0';
     $('status-text').textContent = 'AGENT RUNNING';
     $('status-text').className = 'text-sm font-bold text-green-400';
-    const cycleLabel = d.cycle_type === 'full' ? 'Full Cycle' : d.cycle_type === 'light' ? 'Position Check' : 'Cycle';
+    const cycleLabel = d.cycle_type === 'research' ? 'Research Cycle' : d.cycle_type === 'check' ? 'Check Cycle' : 'Cycle';
     $('status-detail').textContent = cycleLabel + ' ' + d.cycle;
     $('status-detail').className = 'text-xs text-green-600 ml-3';
     document.title = 'RUNNING — BuckFiddy';
@@ -904,6 +922,7 @@ async function updateAgentStatus() {
   }
 
   $('btn-start').classList.toggle('hidden', running);
+  $('btn-single-check').classList.toggle('hidden', running);
   $('btn-single').classList.toggle('hidden', running);
   $('btn-stop').classList.toggle('hidden', !running);
 
@@ -1198,6 +1217,12 @@ async function agentStop() {
 
 async function agentSingle() {
   const r = await fetch('/api/agent/single', { method: 'POST' });
+  if (r.ok) { updateAgentStatus(); }
+  else { const d = await r.json(); alert(d.error || 'Start failed'); }
+}
+
+async function agentSingleCheck() {
+  const r = await fetch('/api/agent/single-check', { method: 'POST' });
   if (r.ok) { updateAgentStatus(); }
   else { const d = await r.json(); alert(d.error || 'Start failed'); }
 }
