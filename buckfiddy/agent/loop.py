@@ -94,8 +94,24 @@ class AgentLoop:
         self.cycle_count = 0
         self._stop_event = threading.Event()
         self.running = False
-        self.current_cycle_type = ""   # "full" | "light" | ""
+        self.current_cycle_type = ""   # "research" | "check" | ""
         self.current_phase = ""        # e.g. "Position Review", "Market Selection", "Research"
+        self._next_check_at: float = 0  # monotonic timestamp
+        self._next_research_at: float = 0  # monotonic timestamp
+
+    @property
+    def next_check_secs(self) -> int:
+        """Seconds until next check cycle, or 0 if not running."""
+        if not self.running:
+            return 0
+        return max(0, int(self._next_check_at - time.monotonic()))
+
+    @property
+    def next_research_secs(self) -> int:
+        """Seconds until next research cycle, or 0 if not running."""
+        if not self.running:
+            return 0
+        return max(0, int(self._next_research_at - time.monotonic()))
 
     def request_stop(self):
         """Signal the agent loop to stop after the current cycle."""
@@ -108,8 +124,8 @@ class AgentLoop:
         self._stop_event.clear()
 
         now = time.monotonic()
-        next_check = now  # Run a check immediately on start
-        next_research = now  # Run research immediately on start
+        self._next_check_at = now  # Run a check immediately on start
+        self._next_research_at = now  # Run research immediately on start
 
         try:
             while not self._stop_event.is_set():
@@ -117,7 +133,7 @@ class AgentLoop:
                 ran_something = False
 
                 # Check cycle is due
-                if now >= next_check:
+                if now >= self._next_check_at:
                     try:
                         self._run_cycle(force_check=True)
                         ran_something = True
@@ -126,13 +142,13 @@ class AgentLoop:
                         break
                     except Exception as e:
                         logger.error(f"Check cycle failed: {e}", exc_info=True)
-                    next_check = time.monotonic() + self.settings.POSITION_CHECK_INTERVAL_SECONDS
+                    self._next_check_at = time.monotonic() + self.settings.POSITION_CHECK_INTERVAL_SECONDS
 
                 if self._stop_event.is_set():
                     break
 
                 # Research cycle is due
-                if now >= next_research:
+                if now >= self._next_research_at:
                     try:
                         self._run_cycle(force_full=True)
                         ran_something = True
@@ -141,12 +157,12 @@ class AgentLoop:
                         break
                     except Exception as e:
                         logger.error(f"Research cycle failed: {e}", exc_info=True)
-                    next_research = time.monotonic() + self.settings.FULL_CYCLE_INTERVAL_SECONDS
+                    self._next_research_at = time.monotonic() + self.settings.FULL_CYCLE_INTERVAL_SECONDS
 
                 if not ran_something or self._stop_event.is_set():
                     # Sleep until next event
                     self.current_phase = "Sleeping"
-                    wake_at = min(next_check, next_research)
+                    wake_at = min(self._next_check_at, self._next_research_at)
                     sleep_for = max(0, wake_at - time.monotonic())
                     if sleep_for > 0:
                         logger.info(f"Sleeping {sleep_for:.0f}s until next cycle...")

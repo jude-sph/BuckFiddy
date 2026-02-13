@@ -391,6 +391,8 @@ def api_agent_status():
         "light_interval": a.settings.POSITION_CHECK_INTERVAL_SECONDS if a else settings.POSITION_CHECK_INTERVAL_SECONDS,
         "markets_per_cycle": a.settings.MAX_NEW_ESTIMATES_PER_CYCLE if a else settings.MAX_NEW_ESTIMATES_PER_CYCLE,
         "edge_threshold": a.settings.EDGE_THRESHOLD if a else settings.EDGE_THRESHOLD,
+        "next_check_secs": a.next_check_secs if a else 0,
+        "next_research_secs": a.next_research_secs if a else 0,
     }
 
 
@@ -629,6 +631,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <span id="status-text" class="text-sm font-semibold text-slate-400">Stopped</span>
         <span id="status-detail" class="text-xs text-slate-600 ml-3"></span>
         <span id="phase-badge" class="hidden ml-2 px-2 py-0.5 rounded text-xs font-medium bg-purple-900/50 text-purple-300 border border-purple-800"></span>
+        <span id="next-timers" class="hidden ml-3 text-xs text-slate-500 font-mono"></span>
       </div>
     </div>
     <div class="flex items-center gap-2">
@@ -895,6 +898,17 @@ async function updateAgentStatus() {
     } else {
       phaseBadge.classList.add('hidden');
     }
+    // Countdown timers
+    const timers = $('next-timers');
+    const checkS = d.next_check_secs || 0;
+    const researchS = d.next_research_secs || 0;
+    if (d.phase === 'Sleeping' && (checkS > 0 || researchS > 0)) {
+      const fmtTime = (s) => s >= 3600 ? Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm' : s >= 60 ? Math.floor(s/60) + 'm ' + (s%60) + 's' : s + 's';
+      timers.textContent = 'Check ' + fmtTime(checkS) + ' · Research ' + fmtTime(researchS);
+      timers.classList.remove('hidden');
+    } else {
+      timers.classList.add('hidden');
+    }
   } else {
     banner.className = 'mb-6 rounded-xl px-5 py-3 flex items-center justify-between border transition-all duration-300 bg-slate-900/50 border-slate-800';
     $('status-dot').className = 'w-3 h-3 rounded-full bg-slate-600 shrink-0';
@@ -906,6 +920,7 @@ async function updateAgentStatus() {
     $('btn-stop').disabled = false;
     $('btn-stop').textContent = 'Stop Agent';
     phaseBadge.classList.add('hidden');
+    $('next-timers').classList.add('hidden');
   }
 
   // API key warning
