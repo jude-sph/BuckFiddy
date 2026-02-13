@@ -390,6 +390,7 @@ def api_agent_status():
         "full_interval": a.settings.FULL_CYCLE_INTERVAL_SECONDS if a else settings.FULL_CYCLE_INTERVAL_SECONDS,
         "light_interval": a.settings.POSITION_CHECK_INTERVAL_SECONDS if a else settings.POSITION_CHECK_INTERVAL_SECONDS,
         "markets_per_cycle": a.settings.MAX_NEW_ESTIMATES_PER_CYCLE if a else settings.MAX_NEW_ESTIMATES_PER_CYCLE,
+        "edge_threshold": a.settings.EDGE_THRESHOLD if a else settings.EDGE_THRESHOLD,
     }
 
 
@@ -485,6 +486,7 @@ def api_timing_update(body: dict):
     full = body.get("full_interval")
     light = body.get("light_interval")
     markets = body.get("markets_per_cycle")
+    edge = body.get("edge_threshold")
 
     a = get_or_create_agent()
     if full is not None:
@@ -496,12 +498,16 @@ def api_timing_update(body: dict):
     if markets is not None:
         val = max(1, min(5, int(markets)))  # 1-5 markets
         a.settings.MAX_NEW_ESTIMATES_PER_CYCLE = val
+    if edge is not None:
+        val = max(0.01, min(0.50, float(edge)))  # 1-50%
+        a.settings.EDGE_THRESHOLD = val
 
     return {
         "status": "ok",
         "full_interval": a.settings.FULL_CYCLE_INTERVAL_SECONDS,
         "light_interval": a.settings.POSITION_CHECK_INTERVAL_SECONDS,
         "markets_per_cycle": a.settings.MAX_NEW_ESTIMATES_PER_CYCLE,
+        "edge_threshold": a.settings.EDGE_THRESHOLD,
     }
 
 
@@ -660,7 +666,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <span class="text-slate-700 mx-1">|</span>
         <span class="text-xs text-slate-600">Research</span>
         <input id="timing-markets" type="number" min="1" max="5" step="1" class="w-12 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateTiming()">
-        <span class="text-xs text-slate-600">markets/cycle</span>
+        <span class="text-xs text-slate-600">markets/cycle, edge</span>
+        <input id="timing-edge" type="number" min="1" max="50" step="1" class="w-12 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateTiming()">
+        <span class="text-xs text-slate-600">%</span>
       </div>
     </div>
   </div>
@@ -920,6 +928,9 @@ async function updateAgentStatus() {
   if (d.markets_per_cycle && !$('timing-markets').matches(':focus')) {
     $('timing-markets').value = d.markets_per_cycle;
   }
+  if (d.edge_threshold && !$('timing-edge').matches(':focus')) {
+    $('timing-edge').value = Math.round(d.edge_threshold * 100);
+  }
 
   $('btn-start').classList.toggle('hidden', running);
   $('btn-single-check').classList.toggle('hidden', running);
@@ -1176,10 +1187,11 @@ async function updateTiming() {
   const fullMin = parseInt($('timing-full').value) || 120;
   const lightMin = parseInt($('timing-light').value) || 30;
   const markets = parseInt($('timing-markets').value) || 2;
+  const edgePct = parseInt($('timing-edge').value) || 8;
   await fetch('/api/timing/update', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ full_interval: fullMin * 60, light_interval: lightMin * 60, markets_per_cycle: markets })
+    body: JSON.stringify({ full_interval: fullMin * 60, light_interval: lightMin * 60, markets_per_cycle: markets, edge_threshold: edgePct / 100 })
   });
 }
 
