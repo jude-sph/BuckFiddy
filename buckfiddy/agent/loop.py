@@ -234,6 +234,15 @@ class AgentLoop:
         finally:
             self._log_cycle(summary, len(guard_results), usage)
 
+        # HARD STOP: if this cycle exceeded the cost cap, shut down the agent
+        if usage.total_cost >= self.settings.MAX_CYCLE_COST_USD:
+            logger.error(
+                f"COST CAP EXCEEDED: cycle spent ${usage.total_cost:.4f} "
+                f"(cap: ${self.settings.MAX_CYCLE_COST_USD:.2f}). "
+                f"Stopping agent to prevent further spending."
+            )
+            self.request_stop()
+
     def _run_research_cycle(self, usage: CycleUsage) -> str:
         summary_parts = []
 
@@ -292,6 +301,13 @@ class AgentLoop:
         # Phase 2: Research + trade per market (Sonnet/Opus, fresh conversation each)
         max_research = self.settings.MAX_NEW_ESTIMATES_PER_CYCLE
         for i, market_info in enumerate(selected[:max_research]):
+            # Cost cap check between phases
+            if usage.total_cost >= self.settings.MAX_CYCLE_COST_USD:
+                logger.warning(
+                    f"Cost cap reached (${usage.total_cost:.4f}), "
+                    f"skipping remaining research phases"
+                )
+                break
             self.current_phase = f"Research ({i+1}/{len(selected[:max_research])})"
             logger.info(
                 f"Phase 3.{i+1}: Researching '{market_info.get('question', '?')[:60]}'"
@@ -326,6 +342,13 @@ class AgentLoop:
                 f"Escalating {len(pending)} position(s) to senior model for close review"
             )
             for i, review in enumerate(pending):
+                # Cost cap check between close reviews
+                if usage.total_cost >= self.settings.MAX_CYCLE_COST_USD:
+                    logger.warning(
+                        f"Cost cap reached (${usage.total_cost:.4f}), "
+                        f"skipping remaining close reviews"
+                    )
+                    break
                 self.current_phase = f"Close Review ({i+1}/{len(pending)})"
                 review_summary = self._phase_close_review(review, usage)
                 summary += f"\n\n[Close Review] {review_summary}"
@@ -558,6 +581,15 @@ class AgentLoop:
         model_short = model.split("-")[1] if "-" in model else model
 
         for turn in range(max_turns):
+            # Cost ceiling: abort if this cycle has already exceeded the limit
+            if usage.total_cost >= self.settings.MAX_CYCLE_COST_USD:
+                logger.warning(
+                    f"[{phase_label}] Cost ceiling reached "
+                    f"(${usage.total_cost:.4f} >= ${self.settings.MAX_CYCLE_COST_USD:.2f}). "
+                    f"Aborting phase."
+                )
+                break
+
             logger.debug(f"[{phase_label}] turn {turn + 1}/{max_turns}")
 
             response = self._api_call_with_retry(

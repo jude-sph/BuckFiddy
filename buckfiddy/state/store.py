@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS trades (
     price REAL NOT NULL,
     size REAL NOT NULL,
     pnl REAL,
+    entry_price REAL,
     estimate_id INTEGER,
     executed_at TEXT NOT NULL
 );
@@ -111,6 +112,24 @@ class StateStore:
     def _init_schema(self):
         self.conn.executescript(SCHEMA)
         self.conn.commit()
+        self._migrate()
+
+    def _migrate(self):
+        """Apply incremental schema migrations for existing databases."""
+        cols = [r[1] for r in self.conn.execute("PRAGMA table_info(trades)").fetchall()]
+        if "entry_price" not in cols:
+            self.conn.execute("ALTER TABLE trades ADD COLUMN entry_price REAL")
+            # Backfill: BUY trades entered at their fill price
+            self.conn.execute(
+                "UPDATE trades SET entry_price = price WHERE side = 'BUY' AND entry_price IS NULL"
+            )
+            # Backfill: SELL trades — derive entry_price from pnl
+            # pnl = (price - entry_price) * size → entry_price = price - pnl/size
+            self.conn.execute(
+                "UPDATE trades SET entry_price = price - (pnl / size) "
+                "WHERE side = 'SELL' AND pnl IS NOT NULL AND size > 0 AND entry_price IS NULL"
+            )
+            self.conn.commit()
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         return self.conn.execute(sql, params)

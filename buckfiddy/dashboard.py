@@ -303,13 +303,24 @@ def api_trades():
                 market_midpoint = market_midpoint or fallback["market_midpoint"]
                 edge = edge or fallback["edge"]
 
+        # Compute percent PnL from entry_price
+        pnl = r["pnl"]
+        entry_price = r["entry_price"] if "entry_price" in r.keys() else None
+        pnl_pct = None
+        if pnl is not None and entry_price and entry_price > 0:
+            cost_basis = entry_price * r["size"]
+            if cost_basis > 0:
+                pnl_pct = round(pnl / cost_basis, 4)
+
         result.append({
             "trade_id": r["trade_id"],
             "outcome": r["outcome"],
             "side": r["side"],
             "price": r["price"],
             "size": r["size"],
-            "pnl": r["pnl"],
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+            "entry_price": entry_price,
             "estimate_id": r["estimate_id"],
             "claude_estimate": claude_estimate,
             "market_midpoint": market_midpoint,
@@ -418,6 +429,7 @@ def api_agent_status():
         "market_cooldown": (a.settings.MARKET_COOLDOWN_SECONDS if a else settings.MARKET_COOLDOWN_SECONDS) // 60,
         "stop_loss_pct": a.settings.STOP_LOSS_PCT if a else settings.STOP_LOSS_PCT,
         "take_profit_pct": a.settings.TAKE_PROFIT_PCT if a else settings.TAKE_PROFIT_PCT,
+        "max_cycle_cost": a.settings.MAX_CYCLE_COST_USD if a else settings.MAX_CYCLE_COST_USD,
         "next_check_secs": a.next_check_secs if a else 0,
         "next_research_secs": a.next_research_secs if a else 0,
     }
@@ -519,6 +531,7 @@ def api_timing_update(body: dict):
     cooldown = body.get("market_cooldown")
     stop_loss = body.get("stop_loss")
     take_profit = body.get("take_profit")
+    cost_cap = body.get("max_cycle_cost")
 
     a = get_or_create_agent()
     if full is not None:
@@ -542,6 +555,9 @@ def api_timing_update(body: dict):
     if take_profit is not None:
         val = max(0.10, min(0.90, float(take_profit)))  # 10-90%
         a.settings.TAKE_PROFIT_PCT = val
+    if cost_cap is not None:
+        val = max(0.10, min(10.0, float(cost_cap)))  # $0.10-$10.00
+        a.settings.MAX_CYCLE_COST_USD = val
 
     return {
         "status": "ok",
@@ -552,6 +568,7 @@ def api_timing_update(body: dict):
         "market_cooldown": a.settings.MARKET_COOLDOWN_SECONDS // 60,
         "stop_loss": a.settings.STOP_LOSS_PCT,
         "take_profit": a.settings.TAKE_PROFIT_PCT,
+        "max_cycle_cost": a.settings.MAX_CYCLE_COST_USD,
     }
 
 
@@ -734,6 +751,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="flex items-center gap-1"><span class="text-slate-500">Take profit</span>
             <input id="setting-takeprofit" type="number" min="10" max="90" step="5" class="w-12 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateSettings()">
             <span class="text-slate-600">%</span></div>
+          <div class="flex items-center gap-1"><span class="text-slate-500">Cycle cost cap</span>
+            <input id="setting-costcap" type="number" min="0.10" max="10" step="0.10" class="w-14 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateSettings()">
+            <span class="text-slate-600">$</span></div>
         </div>
       </div>
     </div>
@@ -1018,6 +1038,9 @@ async function updateAgentStatus() {
   if (d.take_profit_pct != null && !$('setting-takeprofit').matches(':focus')) {
     $('setting-takeprofit').value = Math.round(d.take_profit_pct * 100);
   }
+  if (d.max_cycle_cost != null && !$('setting-costcap').matches(':focus')) {
+    $('setting-costcap').value = d.max_cycle_cost;
+  }
 
   $('btn-start').classList.toggle('hidden', running);
   $('btn-single-check').classList.toggle('hidden', running);
@@ -1169,7 +1192,7 @@ async function updateTrades() {
       <th class="text-left pb-2">Market</th>
       <th class="text-left pb-2">Side</th>
       <th class="text-right pb-2">Price</th>
-      <th class="text-right pb-2">Size</th>
+      <th class="text-right pb-2">Cost</th>
       <th class="text-right pb-2">Edge</th>
       <th class="text-right pb-2">P&L</th>
     </tr></thead>
@@ -1181,9 +1204,9 @@ async function updateTrades() {
       <td class="max-w-[250px] truncate" title="${(t.market_question || '').replace(/"/g, '&quot;')}">${t.market_question || t.outcome}</td>
       <td><span class="px-2 py-0.5 rounded text-xs font-medium ${t.side === 'BUY' ? 'badge-buy' : 'badge-sell'}">${t.side} ${t.outcome}</span></td>
       <td class="text-right font-mono">$${t.price.toFixed(3)}</td>
-      <td class="text-right font-mono">${t.size.toFixed(1)}</td>
+      <td class="text-right font-mono">${t.entry_price ? '$' + (t.entry_price * t.size).toFixed(2) : t.size.toFixed(1)}</td>
       <td class="text-right font-mono ${t.edge ? pnlClass(t.edge) : 'text-slate-600'}">${t.edge ? (t.edge * 100).toFixed(1) + '%' : '-'}</td>
-      <td class="text-right font-mono ${t.pnl !== null ? pnlClass(t.pnl) : 'text-slate-600'}">${t.pnl !== null ? '$' + t.pnl.toFixed(2) : '-'}</td>
+      <td class="text-right font-mono ${t.pnl !== null ? pnlClass(t.pnl) : 'text-slate-600'}">${t.pnl !== null ? '$' + t.pnl.toFixed(2) + (t.pnl_pct !== null ? ' <span class="text-xs opacity-75">(' + (t.pnl_pct >= 0 ? '+' : '') + (t.pnl_pct * 100).toFixed(1) + '%)</span>' : '') : '-'}</td>
     </tr>
     ${t.reasoning ? '<tr id="trade-detail-'+id+'" class="'+(expanded ? '' : 'hidden ')+' border-t border-slate-800/50"><td colspan="7" class="py-3 px-4"><div class="text-xs text-slate-400 whitespace-pre-wrap bg-slate-900/50 rounded-lg p-3">' + (t.claude_estimate ? '<span class="text-slate-500 font-semibold">Claude\\'s estimate:</span> ' + (t.claude_estimate * 100).toFixed(1) + '% vs market ' + (t.market_midpoint * 100).toFixed(1) + '%<br><br>' : '') + t.reasoning + '</div></td></tr>' : ''}`;
     }).join('')}</tbody></table>`;
@@ -1280,6 +1303,7 @@ async function updateSettings() {
   const cooldownMin = parseInt($('timing-cooldown').value) || 0;
   const stopLoss = parseInt($('setting-stoploss').value) || 50;
   const takeProfit = parseInt($('setting-takeprofit').value) || 40;
+  const costCap = parseFloat($('setting-costcap').value) || 1.00;
   await fetch('/api/timing/update', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -1290,7 +1314,8 @@ async function updateSettings() {
       edge_threshold: edgePct / 100,
       market_cooldown: cooldownMin * 60,
       stop_loss: stopLoss / 100,
-      take_profit: takeProfit / 100
+      take_profit: takeProfit / 100,
+      max_cycle_cost: costCap
     })
   });
 }

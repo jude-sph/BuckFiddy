@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     MAX_MARKETS_PER_SCAN: int = 5
     MARKET_COOLDOWN_SECONDS: int = 14400  # 4 hours — skip recently researched markets
 
+    # Cost safeguards
+    MAX_CYCLE_COST_USD: float = 1.00  # Abort cycle if Claude API cost exceeds this
+
     # Persistence
     DB_PATH: str = "data/buckfiddy.db"
 

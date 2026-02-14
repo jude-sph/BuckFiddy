@@ -281,6 +281,7 @@ class MockTradingBackend:
     ) -> TradeResult:
         balance = self._get_balance()
         pnl = None
+        entry_price = None
 
         if side == "BUY":
             cost = fill_price * size
@@ -291,6 +292,7 @@ class MockTradingBackend:
                 )
             self._set_balance(balance - cost)
             self._add_to_position(token_id, meta, size, fill_price, now)
+            entry_price = fill_price
         else:
             # Sell: reduce position and credit proceeds
             pos = self.store.fetchone(
@@ -303,8 +305,9 @@ class MockTradingBackend:
                     success=False,
                     message=f"Insufficient position: want to sell {size:.2f}, have {avail:.2f}",
                 )
+            entry_price = pos["avg_entry_price"]
             proceeds = fill_price * size
-            pnl = (fill_price - pos["avg_entry_price"]) * size
+            pnl = (fill_price - entry_price) * size
             self._set_balance(balance + proceeds)
             self._reduce_position(token_id, size)
 
@@ -312,8 +315,8 @@ class MockTradingBackend:
         trade_id = str(uuid4())[:8]
         self.store.execute(
             "INSERT INTO trades (trade_id, order_id, market_id, token_id, outcome, "
-            "side, price, size, pnl, estimate_id, executed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "side, price, size, pnl, entry_price, estimate_id, executed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 trade_id,
                 order_id,
@@ -324,6 +327,7 @@ class MockTradingBackend:
                 fill_price,
                 size,
                 pnl,
+                entry_price,
                 estimate_id,
                 now,
             ),
