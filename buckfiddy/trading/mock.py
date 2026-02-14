@@ -31,6 +31,7 @@ class MockTradingBackend:
         self.settings = settings
         self.store = StateStore(settings.DB_PATH)
         self._ensure_wallet(settings.STARTING_BALANCE)
+        self._repair_balance(settings.STARTING_BALANCE)
         # Cache: token_id -> {market_id, outcome, market_question}
         self._token_meta: dict[str, dict] = {}
 
@@ -41,6 +42,31 @@ class MockTradingBackend:
                 "INSERT INTO wallet (id, balance) VALUES (1, ?)", (starting_balance,)
             )
             self.store.commit()
+
+    def _repair_balance(self, starting_balance: float):
+        """One-time fix: recalculate balance from trade history.
+
+        Corrects balances that were wrongly reduced by API cost deductions.
+        """
+        trades = self.store.fetchall(
+            "SELECT side, price, size FROM trades ORDER BY executed_at"
+        )
+        if not trades:
+            return  # No trades — nothing to repair
+        correct = starting_balance
+        for t in trades:
+            if t["side"] == "BUY":
+                correct -= t["price"] * t["size"]
+            else:
+                correct += t["price"] * t["size"]
+        correct = round(correct, 6)
+        current = self._get_balance()
+        if abs(current - correct) > 0.001:
+            logger.info(
+                f"Balance repair: {current:.4f} -> {correct:.4f} "
+                f"(removed {current - correct:+.4f} of API cost deductions)"
+            )
+            self._set_balance(correct)
 
     def _get_balance(self) -> float:
         row = self.store.fetchone("SELECT balance FROM wallet WHERE id = 1")

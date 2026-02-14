@@ -882,14 +882,6 @@ class AgentLoop:
     def _log_cycle(self, summary: str, stop_losses: int, usage: CycleUsage):
         try:
             now = datetime.now(timezone.utc).isoformat()
-            cost = usage.total_cost
-
-            # Deduct API cost from mock balance (real costs reduce real money)
-            if cost > 0 and hasattr(self.backend, "_set_balance"):
-                current_bal = self.backend._get_balance()
-                self.backend._set_balance(round(current_bal - cost, 6))
-                logger.info(f"Deducted ${cost:.4f} API cost from balance")
-
             wallet = self.backend.get_wallet_state()
 
             # Final flush of API usage
