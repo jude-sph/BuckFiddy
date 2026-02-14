@@ -276,12 +276,34 @@ def api_trades():
     s = get_store()
     rows = s.fetchall(
         "SELECT t.*, e.claude_estimate, e.market_midpoint, e.edge, "
-        "e.reasoning AS estimate_reasoning, e.market_question "
+        "e.reasoning AS estimate_reasoning, e.market_question AS est_market_question "
         "FROM trades t LEFT JOIN estimates e ON t.estimate_id = e.id "
         "ORDER BY t.executed_at DESC LIMIT 50"
     )
-    return [
-        {
+    result = []
+    for r in rows:
+        reasoning = r["estimate_reasoning"]
+        market_question = r["est_market_question"]
+        claude_estimate = r["claude_estimate"]
+        market_midpoint = r["market_midpoint"]
+        edge = r["edge"]
+
+        # For SELL trades without a linked estimate (e.g. risk guard closures),
+        # find the most recent estimate for this market to show reasoning
+        if not reasoning and r["side"] == "SELL":
+            fallback = s.fetchone(
+                "SELECT claude_estimate, market_midpoint, edge, reasoning, market_question "
+                "FROM estimates WHERE market_id = ? ORDER BY id DESC LIMIT 1",
+                (r["market_id"],),
+            )
+            if fallback:
+                reasoning = fallback["reasoning"]
+                market_question = market_question or fallback["market_question"]
+                claude_estimate = claude_estimate or fallback["claude_estimate"]
+                market_midpoint = market_midpoint or fallback["market_midpoint"]
+                edge = edge or fallback["edge"]
+
+        result.append({
             "trade_id": r["trade_id"],
             "outcome": r["outcome"],
             "side": r["side"],
@@ -289,15 +311,14 @@ def api_trades():
             "size": r["size"],
             "pnl": r["pnl"],
             "estimate_id": r["estimate_id"],
-            "claude_estimate": r["claude_estimate"],
-            "market_midpoint": r["market_midpoint"],
-            "edge": r["edge"],
-            "reasoning": r["estimate_reasoning"],
-            "market_question": r["market_question"],
+            "claude_estimate": claude_estimate,
+            "market_midpoint": market_midpoint,
+            "edge": edge,
+            "reasoning": reasoning,
+            "market_question": market_question,
             "executed_at": r["executed_at"],
-        }
-        for r in rows
-    ]
+        })
+    return result
 
 
 @app.get("/api/estimates")
@@ -1164,7 +1185,7 @@ async function updateTrades() {
       <td class="text-right font-mono ${t.edge ? pnlClass(t.edge) : 'text-slate-600'}">${t.edge ? (t.edge * 100).toFixed(1) + '%' : '-'}</td>
       <td class="text-right font-mono ${t.pnl !== null ? pnlClass(t.pnl) : 'text-slate-600'}">${t.pnl !== null ? '$' + t.pnl.toFixed(2) : '-'}</td>
     </tr>
-    ${t.reasoning ? '<tr id="trade-detail-'+id+'" class="'+(expanded ? '' : 'hidden ')+' border-t border-slate-800/50"><td colspan="7" class="py-3 px-4"><div class="text-xs text-slate-400 whitespace-pre-wrap bg-slate-900/50 rounded-lg p-3"><span class="text-slate-500 font-semibold">Claude\\'s estimate:</span> ' + (t.claude_estimate * 100).toFixed(1) + '% vs market ' + (t.market_midpoint * 100).toFixed(1) + '%<br><br>' + t.reasoning + '</div></td></tr>' : ''}`;
+    ${t.reasoning ? '<tr id="trade-detail-'+id+'" class="'+(expanded ? '' : 'hidden ')+' border-t border-slate-800/50"><td colspan="7" class="py-3 px-4"><div class="text-xs text-slate-400 whitespace-pre-wrap bg-slate-900/50 rounded-lg p-3">' + (t.claude_estimate ? '<span class="text-slate-500 font-semibold">Claude\\'s estimate:</span> ' + (t.claude_estimate * 100).toFixed(1) + '% vs market ' + (t.market_midpoint * 100).toFixed(1) + '%<br><br>' : '') + t.reasoning + '</div></td></tr>' : ''}`;
     }).join('')}</tbody></table>`;
 }
 

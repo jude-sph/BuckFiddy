@@ -209,14 +209,16 @@ class AgentLoop:
         self.current_phase = "Starting"
         logger.info(f"=== Cycle {self.cycle_count} ({self.current_cycle_type}) starting ===")
 
-        # Hard risk guards (outside Claude's control)
-        guard_results = check_risk_guards(
-            self.backend,
-            self.settings.STOP_LOSS_PCT,
-            self.settings.TAKE_PROFIT_PCT,
-        )
-        for gr in guard_results:
-            logger.warning(f"{gr.guard_type.upper()}: {gr.message}")
+        # Hard risk guards (outside Claude's control) — only on check cycles
+        guard_results = []
+        if not is_full:
+            guard_results = check_risk_guards(
+                self.backend,
+                self.settings.STOP_LOSS_PCT,
+                self.settings.TAKE_PROFIT_PCT,
+            )
+            for gr in guard_results:
+                logger.warning(f"{gr.guard_type.upper()}: {gr.message}")
 
         # Check and fill any open limit orders (mock backend only)
         if hasattr(self.backend, "check_open_orders"):
