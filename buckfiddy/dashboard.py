@@ -114,6 +114,7 @@ def _price_update_loop():
                         "outcome": p.outcome,
                         "size": p.size,
                         "avg_entry_price": p.avg_entry_price,
+                        "current_price": round(p.current_value / p.size, 4) if p.size > 0 else 0,
                         "current_value": p.current_value,
                         "unrealized_pnl": p.unrealized_pnl,
                         "unrealized_pnl_pct": p.unrealized_pnl_pct,
@@ -261,6 +262,7 @@ def api_positions():
             "outcome": r["outcome"],
             "size": r["size"],
             "avg_entry_price": r["avg_entry_price"],
+            "current_price": r["avg_entry_price"],
             "current_value": round(r["size"] * r["avg_entry_price"], 4),
             "unrealized_pnl": 0,
             "unrealized_pnl_pct": 0,
@@ -1120,6 +1122,7 @@ async function updatePositions() {
       <th class="text-left pb-2">Side</th>
       <th class="text-right pb-2">Shares</th>
       <th class="text-right pb-2">Entry</th>
+      <th class="text-right pb-2">Current</th>
       <th class="text-right pb-2">Value</th>
       <th class="text-right pb-2">P&L</th>
     </tr></thead>
@@ -1127,7 +1130,8 @@ async function updatePositions() {
       <td class="py-2 pr-3 max-w-[200px] truncate" title="${(p.market_question || '').replace(/"/g, '&quot;')}">${p.market_question}</td>
       <td><span class="px-2 py-0.5 rounded text-xs font-medium badge-yes">${p.outcome}</span></td>
       <td class="text-right font-mono">${p.size.toFixed(1)}</td>
-      <td class="text-right font-mono">$${p.avg_entry_price.toFixed(3)}</td>
+      <td class="text-right font-mono">${(p.avg_entry_price * 100).toFixed(1)}%</td>
+      <td class="text-right font-mono ${pnlClass(p.current_price - p.avg_entry_price)}">${(p.current_price * 100).toFixed(1)}%</td>
       <td class="text-right font-mono">${fmtUsd(p.current_value)}</td>
       <td class="text-right font-mono ${pnlClass(p.unrealized_pnl)}">${fmtUsd(p.unrealized_pnl)} (${fmtPct(p.unrealized_pnl_pct * 100)})</td>
     </tr>`).join('')}</tbody></table>`;
