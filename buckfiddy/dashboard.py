@@ -96,10 +96,74 @@ _live_state_lock = threading.Lock()
 _price_updater_started = False
 
 
+_slugs_backfilled = False
+
+
+def _backfill_slugs():
+    """One-time: fetch slugs from Gamma API for positions/estimates missing them."""
+    global _slugs_backfilled
+    if _slugs_backfilled:
+        return
+    _slugs_backfilled = True
+
+    try:
+        import requests as _req
+        s = get_store()
+        # Collect market_ids with missing slugs
+        missing_pos = s.fetchall(
+            "SELECT DISTINCT market_id FROM positions WHERE (slug IS NULL OR slug = '') AND size > 0"
+        )
+        missing_est = s.fetchall(
+            "SELECT DISTINCT market_id FROM estimates WHERE slug IS NULL OR slug = ''"
+        )
+        market_ids = {r["market_id"] for r in missing_pos} | {r["market_id"] for r in missing_est}
+        if not market_ids:
+            return
+
+        # Fetch from Gamma API in one batch (filter by conditionIds)
+        slug_map = {}
+        for mid in market_ids:
+            try:
+                resp = _req.get(
+                    "https://gamma-api.polymarket.com/markets",
+                    params={"conditionId": mid, "limit": 1},
+                    timeout=10,
+                )
+                if resp.ok:
+                    data = resp.json()
+                    if data and isinstance(data, list) and data[0].get("slug"):
+                        slug_map[mid] = data[0]["slug"]
+            except Exception:
+                pass
+
+        if not slug_map:
+            return
+
+        # Update DB
+        for mid, slug in slug_map.items():
+            s.execute("UPDATE positions SET slug = ? WHERE market_id = ? AND (slug IS NULL OR slug = '')", (slug, mid))
+            s.execute("UPDATE estimates SET slug = ? WHERE market_id = ? AND (slug IS NULL OR slug = '')", (slug, mid))
+        s.commit()
+
+        # Update token_meta cache on the backend
+        a = get_or_create_agent()
+        if hasattr(a.backend, '_token_meta'):
+            for tid, meta in a.backend._token_meta.items():
+                mid = meta.get("market_id", "")
+                if mid in slug_map and not meta.get("slug"):
+                    meta["slug"] = slug_map[mid]
+
+        log = logging.getLogger("buckfiddy.slug_backfill")
+        log.info(f"Backfilled slugs for {len(slug_map)} markets")
+    except Exception as e:
+        logging.getLogger("buckfiddy.slug_backfill").debug(f"Slug backfill failed: {e}")
+
+
 def _price_update_loop():
     """Background thread: fetch live prices for open positions every 30s."""
     while True:
         try:
+            _backfill_slugs()
             a = get_or_create_agent()
             wallet = a.backend.get_wallet_state()
             with _live_state_lock:
