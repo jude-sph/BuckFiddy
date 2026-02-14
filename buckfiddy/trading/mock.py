@@ -73,13 +73,15 @@ class MockTradingBackend:
         return float(data.get("price", 0))
 
     def register_token_meta(
-        self, token_id: str, market_id: str, outcome: str, market_question: str
+        self, token_id: str, market_id: str, outcome: str, market_question: str,
+        slug: str = "",
     ):
         """Register metadata for a token so we can track positions properly."""
         self._token_meta[token_id] = {
             "market_id": market_id,
             "outcome": outcome,
             "market_question": market_question,
+            "slug": slug,
         }
 
     def _get_token_meta(self, token_id: str) -> dict:
@@ -87,7 +89,7 @@ class MockTradingBackend:
             return self._token_meta[token_id]
         # Try to find from existing positions
         row = self.store.fetchone(
-            "SELECT market_id, outcome, market_question FROM positions WHERE token_id = ?",
+            "SELECT market_id, outcome, market_question, slug FROM positions WHERE token_id = ?",
             (token_id,),
         )
         if row:
@@ -95,10 +97,11 @@ class MockTradingBackend:
                 "market_id": row["market_id"],
                 "outcome": row["outcome"],
                 "market_question": row["market_question"],
+                "slug": row["slug"] if "slug" in row.keys() else "",
             }
             self._token_meta[token_id] = meta
             return meta
-        return {"market_id": "unknown", "outcome": "unknown", "market_question": "unknown"}
+        return {"market_id": "unknown", "outcome": "unknown", "market_question": "unknown", "slug": ""}
 
     def get_wallet_state(self) -> WalletState:
         balance = self._get_balance()
@@ -381,7 +384,9 @@ class MockTradingBackend:
         else:
             position_id = str(uuid4())[:8]
             self.store.execute(
-                "INSERT INTO positions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO positions (position_id, market_id, token_id, market_question, "
+                "outcome, size, avg_entry_price, created_at, slug) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     position_id,
                     meta["market_id"],
@@ -391,6 +396,7 @@ class MockTradingBackend:
                     size,
                     price,
                     now,
+                    meta.get("slug", ""),
                 ),
             )
         self.store.commit()

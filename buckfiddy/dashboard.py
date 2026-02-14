@@ -118,6 +118,8 @@ def _price_update_loop():
                         "current_value": p.current_value,
                         "unrealized_pnl": p.unrealized_pnl,
                         "unrealized_pnl_pct": p.unrealized_pnl_pct,
+                        "slug": (a.backend._get_token_meta(p.token_id).get("slug", "")
+                                 if hasattr(a.backend, '_get_token_meta') else ""),
                     }
                     for p in wallet.positions
                 ]
@@ -266,6 +268,7 @@ def api_positions():
             "current_value": round(r["size"] * r["avg_entry_price"], 4),
             "unrealized_pnl": 0,
             "unrealized_pnl_pct": 0,
+            "slug": r["slug"] if "slug" in r.keys() else "",
         }
         for r in rows
     ]
@@ -276,7 +279,8 @@ def api_trades():
     s = get_store()
     rows = s.fetchall(
         "SELECT t.*, e.claude_estimate, e.market_midpoint, e.edge, "
-        "e.reasoning AS estimate_reasoning, e.market_question AS est_market_question "
+        "e.reasoning AS estimate_reasoning, e.market_question AS est_market_question, "
+        "e.slug AS est_slug "
         "FROM trades t LEFT JOIN estimates e ON t.estimate_id = e.id "
         "ORDER BY t.executed_at DESC LIMIT 50"
     )
@@ -287,12 +291,13 @@ def api_trades():
         claude_estimate = r["claude_estimate"]
         market_midpoint = r["market_midpoint"]
         edge = r["edge"]
+        slug = r["est_slug"] if "est_slug" in r.keys() else ""
 
         # For SELL trades without a linked estimate (e.g. risk guard closures),
         # find the most recent estimate for this market to show reasoning
         if not reasoning and r["side"] == "SELL":
             fallback = s.fetchone(
-                "SELECT claude_estimate, market_midpoint, edge, reasoning, market_question "
+                "SELECT claude_estimate, market_midpoint, edge, reasoning, market_question, slug "
                 "FROM estimates WHERE market_id = ? ORDER BY id DESC LIMIT 1",
                 (r["market_id"],),
             )
@@ -302,6 +307,7 @@ def api_trades():
                 claude_estimate = claude_estimate or fallback["claude_estimate"]
                 market_midpoint = market_midpoint or fallback["market_midpoint"]
                 edge = edge or fallback["edge"]
+                slug = slug or (fallback["slug"] if "slug" in fallback.keys() else "")
 
         # Compute percent PnL from entry_price
         pnl = r["pnl"]
@@ -327,6 +333,7 @@ def api_trades():
             "edge": edge,
             "reasoning": reasoning,
             "market_question": market_question,
+            "slug": slug or "",
             "executed_at": r["executed_at"],
         })
     return result
@@ -342,6 +349,7 @@ def api_estimates():
         {
             "id": r["id"],
             "market_question": r["market_question"] if "market_question" in r.keys() else "",
+            "slug": r["slug"] if "slug" in r.keys() else "",
             "outcome": r["outcome"],
             "claude_estimate": r["claude_estimate"],
             "market_midpoint": r["market_midpoint"],
@@ -617,6 +625,26 @@ def api_agent_single():
     return {"status": "started_single"}
 
 
+@app.post("/api/position/close")
+def api_position_close(body: dict):
+    position_id = body.get("position_id")
+    if not position_id:
+        return JSONResponse({"error": "position_id required"}, status_code=400)
+    a = get_or_create_agent()
+    try:
+        result = a.backend.close_position(position_id)
+        return {
+            "success": result.success,
+            "message": result.message,
+            "order_id": result.order_id,
+            "filled_price": result.filled_price,
+            "filled_size": result.filled_size,
+            "pnl": result.pnl,
+        }
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @app.post("/api/agent/single-check")
 def api_agent_single_check():
     global agent_thread
@@ -863,6 +891,7 @@ let logCursor = 0;
 // Track expanded rows so refreshes don't collapse them
 const expandedTrades = new Set();
 const expandedEstimates = new Set();
+const expandedPositions = new Set();
 
 // Cost limit (persisted in localStorage)
 let costLimitAlerted = false;
@@ -881,6 +910,12 @@ function saveCostLimit() {
   if (el) el.value = saved;
 })();
 
+function polyUrl(slug) { return slug ? 'https://polymarket.com/event/' + slug : ''; }
+function marketLink(question, slug) {
+  const text = (question || '').replace(/</g, '&lt;');
+  if (!slug) return text;
+  return '<a href="' + polyUrl(slug) + '" target="_blank" rel="noopener" class="hover:text-blue-400 transition-colors" onclick="event.stopPropagation()">' + text + ' <span class="text-slate-600 text-[10px]">&#8599;</span></a>';
+}
 function fmtUsd(v) { return '$' + Number(v).toFixed(2); }
 function fmtPct(v) { return (v >= 0 ? '+' : '') + Number(v).toFixed(1) + '%'; }
 function fmtTime(iso) {
@@ -900,6 +935,33 @@ function toggleEstimate(id) {
   if (expandedEstimates.has(id)) expandedEstimates.delete(id); else expandedEstimates.add(id);
   const el = document.getElementById('est-detail-' + id);
   if (el) el.classList.toggle('hidden');
+}
+function togglePosition(id) {
+  if (expandedPositions.has(id)) expandedPositions.delete(id); else expandedPositions.add(id);
+  const el = document.getElementById('pos-detail-' + id);
+  if (el) el.classList.toggle('hidden');
+}
+async function closePosition(positionId) {
+  if (!confirm('Close this position at market price?')) return;
+  const btn = document.getElementById('close-btn-' + positionId);
+  if (btn) { btn.disabled = true; btn.textContent = 'Closing...'; }
+  try {
+    const r = await fetch('/api/position/close', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({position_id: positionId})
+    });
+    const d = await r.json();
+    if (r.ok && d.success) {
+      refreshAll();
+    } else {
+      alert(d.error || d.message || 'Close failed');
+      if (btn) { btn.disabled = false; btn.textContent = 'Close Position'; }
+    }
+  } catch(e) {
+    alert('Error: ' + e.message);
+    if (btn) { btn.disabled = false; btn.textContent = 'Close Position'; }
+  }
 }
 
 async function fetchJson(url) {
@@ -1170,15 +1232,33 @@ async function updatePositions() {
       <th class="text-right pb-2">Value</th>
       <th class="text-right pb-2">P&L</th>
     </tr></thead>
-    <tbody>${data.map(p => `<tr class="border-t border-slate-800">
-      <td class="py-2 pr-3 max-w-[200px] truncate" title="${(p.market_question || '').replace(/"/g, '&quot;')}">${p.market_question}</td>
+    <tbody>${data.map(p => {
+      const id = p.position_id;
+      const expanded = expandedPositions.has(id);
+      return `<tr class="border-t border-slate-800 cursor-pointer hover:bg-slate-800/30" onclick="togglePosition('${id}')">
+      <td class="py-2 pr-3 max-w-[200px] truncate" title="${(p.market_question || '').replace(/"/g, '&quot;')}">${marketLink(p.market_question, p.slug)}</td>
       <td><span class="px-2 py-0.5 rounded text-xs font-medium badge-yes">${p.outcome}</span></td>
       <td class="text-right font-mono">${p.size.toFixed(1)}</td>
       <td class="text-right font-mono">${(p.avg_entry_price * 100).toFixed(1)}%</td>
       <td class="text-right font-mono ${pnlClass(p.current_price - p.avg_entry_price)}">${(p.current_price * 100).toFixed(1)}%</td>
       <td class="text-right font-mono">${fmtUsd(p.current_value)}</td>
       <td class="text-right font-mono ${pnlClass(p.unrealized_pnl)}">${fmtUsd(p.unrealized_pnl)} (${fmtPct(p.unrealized_pnl_pct * 100)})</td>
-    </tr>`).join('')}</tbody></table>`;
+    </tr>
+    <tr id="pos-detail-${id}" class="${expanded ? '' : 'hidden'} border-t border-slate-800/50">
+      <td colspan="7" class="py-3 px-4">
+        <div class="flex items-center justify-between bg-slate-900/50 rounded-lg p-3">
+          <div class="text-xs text-slate-400">
+            <span class="text-slate-500">Cost basis:</span> ${fmtUsd(p.avg_entry_price * p.size)}
+            <span class="text-slate-600 mx-2">|</span>
+            <span class="text-slate-500">Current value:</span> ${fmtUsd(p.current_value)}
+            <span class="text-slate-600 mx-2">|</span>
+            <span class="text-slate-500">ID:</span> <span class="font-mono">${id}</span>
+          </div>
+          <button id="close-btn-${id}" onclick="event.stopPropagation(); closePosition('${id}')" class="px-3 py-1.5 text-xs font-medium text-red-400 border border-red-900 rounded-lg hover:bg-red-900/30 transition-colors">Close Position</button>
+        </div>
+      </td>
+    </tr>`;
+    }).join('')}</tbody></table>`;
 }
 
 async function updateTrades() {
@@ -1201,7 +1281,7 @@ async function updateTrades() {
       const expanded = expandedTrades.has(id);
       return `<tr class="border-t border-slate-800 ${t.reasoning ? 'cursor-pointer' : ''}" ${t.reasoning ? 'onclick="toggleTrade(\\''+id+'\\')"' : ''}>
       <td class="py-2 text-slate-400">${fmtTime(t.executed_at)}</td>
-      <td class="max-w-[250px] truncate" title="${(t.market_question || '').replace(/"/g, '&quot;')}">${t.market_question || t.outcome}</td>
+      <td class="max-w-[250px] truncate" title="${(t.market_question || '').replace(/"/g, '&quot;')}">${marketLink(t.market_question || t.outcome, t.slug)}</td>
       <td><span class="px-2 py-0.5 rounded text-xs font-medium ${t.side === 'BUY' ? 'badge-buy' : 'badge-sell'}">${t.side} ${t.outcome}</span></td>
       <td class="text-right font-mono">$${t.price.toFixed(3)}</td>
       <td class="text-right font-mono">${t.entry_price ? '$' + (t.entry_price * t.size).toFixed(2) : t.size.toFixed(1)}</td>
@@ -1232,7 +1312,7 @@ async function updateEstimatesTable() {
       const expanded = expandedEstimates.has(id);
       return `<tr class="border-t border-slate-800 cursor-pointer" onclick="toggleEstimate('${id}')">
       <td class="py-2 text-slate-400">${fmtTime(e.created_at)}</td>
-      <td class="max-w-[350px] truncate" title="${(e.market_question || '').replace(/"/g, '&quot;')}">${e.market_question || '<span class=\\'text-slate-600\\'>—</span>'}</td>
+      <td class="max-w-[350px] truncate" title="${(e.market_question || '').replace(/"/g, '&quot;')}">${e.market_question ? marketLink(e.market_question, e.slug) : '<span class=\\'text-slate-600\\'>—</span>'}</td>
       <td><span class="px-2 py-0.5 rounded text-xs font-medium badge-yes">${e.outcome}</span></td>
       <td class="text-right font-mono">${(e.claude_estimate * 100).toFixed(1)}%</td>
       <td class="text-right font-mono">${(e.market_midpoint * 100).toFixed(1)}%</td>

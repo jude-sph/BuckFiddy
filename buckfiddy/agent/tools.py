@@ -360,7 +360,7 @@ class ToolDispatcher:
             for i, token_id in enumerate(m.clob_token_ids):
                 outcome = m.outcomes[i] if i < len(m.outcomes) else f"Outcome {i}"
                 self.backend.register_token_meta(
-                    token_id, m.market_id, outcome, m.question
+                    token_id, m.market_id, outcome, m.question, slug=m.slug
                 )
                 # Store end_date in our own metadata cache for position reviews
                 self._market_end_dates[m.market_id] = m.end_date
@@ -425,15 +425,17 @@ class ToolDispatcher:
 
         # Log the estimate and get its ID
         now = datetime.now(timezone.utc).isoformat()
+        slug = meta.get("slug", "")
         cursor = self.store.execute(
-            "INSERT INTO estimates (market_id, token_id, outcome, market_question, "
+            "INSERT INTO estimates (market_id, token_id, outcome, market_question, slug, "
             "claude_estimate, market_midpoint, edge, reasoning, tradeable, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 market_id,
                 token_id,
                 outcome,
                 market_question,
+                slug,
                 estimate,
                 midpoint,
                 edge,

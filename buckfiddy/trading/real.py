@@ -159,18 +159,20 @@ class RealTradingBackend:
     # ── Token metadata ──────────────────────────────────────────
 
     def register_token_meta(
-        self, token_id: str, market_id: str, outcome: str, market_question: str
+        self, token_id: str, market_id: str, outcome: str, market_question: str,
+        slug: str = "",
     ):
         self._token_meta[token_id] = {
             "market_id": market_id,
             "outcome": outcome,
             "market_question": market_question,
+            "slug": slug,
         }
 
     def _get_token_meta(self, token_id: str) -> dict:
         return self._token_meta.get(
             token_id,
-            {"market_id": "unknown", "outcome": "unknown", "market_question": "unknown"},
+            {"market_id": "unknown", "outcome": "unknown", "market_question": "unknown", "slug": ""},
         )
 
     # ── Read operations (with retry) ────────────────────────────

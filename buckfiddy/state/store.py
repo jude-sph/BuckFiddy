@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS positions (
     outcome TEXT NOT NULL,
     size REAL NOT NULL,
     avg_entry_price REAL NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    slug TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS orders (
@@ -53,6 +54,7 @@ CREATE TABLE IF NOT EXISTS estimates (
     token_id TEXT NOT NULL,
     outcome TEXT NOT NULL,
     market_question TEXT NOT NULL DEFAULT '',
+    slug TEXT NOT NULL DEFAULT '',
     claude_estimate REAL NOT NULL,
     market_midpoint REAL NOT NULL,
     edge REAL NOT NULL,
@@ -116,19 +118,26 @@ class StateStore:
 
     def _migrate(self):
         """Apply incremental schema migrations for existing databases."""
-        cols = [r[1] for r in self.conn.execute("PRAGMA table_info(trades)").fetchall()]
-        if "entry_price" not in cols:
+        trade_cols = [r[1] for r in self.conn.execute("PRAGMA table_info(trades)").fetchall()]
+        if "entry_price" not in trade_cols:
             self.conn.execute("ALTER TABLE trades ADD COLUMN entry_price REAL")
-            # Backfill: BUY trades entered at their fill price
             self.conn.execute(
                 "UPDATE trades SET entry_price = price WHERE side = 'BUY' AND entry_price IS NULL"
             )
-            # Backfill: SELL trades — derive entry_price from pnl
-            # pnl = (price - entry_price) * size → entry_price = price - pnl/size
             self.conn.execute(
                 "UPDATE trades SET entry_price = price - (pnl / size) "
                 "WHERE side = 'SELL' AND pnl IS NOT NULL AND size > 0 AND entry_price IS NULL"
             )
+            self.conn.commit()
+
+        pos_cols = [r[1] for r in self.conn.execute("PRAGMA table_info(positions)").fetchall()]
+        if "slug" not in pos_cols:
+            self.conn.execute("ALTER TABLE positions ADD COLUMN slug TEXT NOT NULL DEFAULT ''")
+            self.conn.commit()
+
+        est_cols = [r[1] for r in self.conn.execute("PRAGMA table_info(estimates)").fetchall()]
+        if "slug" not in est_cols:
+            self.conn.execute("ALTER TABLE estimates ADD COLUMN slug TEXT NOT NULL DEFAULT ''")
             self.conn.commit()
 
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
