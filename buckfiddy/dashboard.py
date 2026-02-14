@@ -691,24 +691,45 @@ def api_agent_single():
     return {"status": "started_single"}
 
 
-@app.post("/api/slug/backfill")
-def api_slug_backfill(body: dict):
-    """Accept a slug from the frontend and persist it to the DB."""
-    market_id = body.get("market_id")
-    slug = body.get("slug")
-    if not market_id or not slug:
-        return JSONResponse({"error": "market_id and slug required"}, status_code=400)
+@app.post("/api/slugs/resolve")
+def api_slugs_resolve(body: dict):
+    """Resolve market_ids to Polymarket slugs via the Gamma API (server-side proxy)."""
+    import requests as _req
+    market_ids = body.get("market_ids", [])
+    if not market_ids:
+        return {"slugs": {}}
+
     s = get_store()
-    s.execute("UPDATE positions SET slug = ? WHERE market_id = ? AND (slug IS NULL OR slug = '')", (slug, market_id))
-    s.execute("UPDATE estimates SET slug = ? WHERE market_id = ? AND (slug IS NULL OR slug = '')", (slug, market_id))
-    s.commit()
-    # Also update in-memory token_meta
-    a = get_or_create_agent()
-    if hasattr(a.backend, '_token_meta'):
-        for meta in a.backend._token_meta.values():
-            if meta.get("market_id") == market_id and not meta.get("slug"):
-                meta["slug"] = slug
-    return {"status": "ok"}
+    slug_map = {}
+    for mid in market_ids[:20]:  # Cap at 20 to avoid abuse
+        try:
+            resp = _req.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={"conditionId": mid, "limit": 1},
+                timeout=5,
+            )
+            if resp.ok:
+                data = resp.json()
+                if data and isinstance(data, list) and data[0].get("slug"):
+                    slug_map[mid] = data[0]["slug"]
+        except Exception:
+            pass
+
+    # Persist resolved slugs to DB
+    if slug_map:
+        for mid, slug in slug_map.items():
+            s.execute("UPDATE positions SET slug = ? WHERE market_id = ? AND (slug IS NULL OR slug = '')", (slug, mid))
+            s.execute("UPDATE estimates SET slug = ? WHERE market_id = ? AND (slug IS NULL OR slug = '')", (slug, mid))
+        s.commit()
+        # Update in-memory token_meta
+        a = get_or_create_agent()
+        if hasattr(a.backend, '_token_meta'):
+            for meta in a.backend._token_meta.values():
+                mid = meta.get("market_id", "")
+                if mid in slug_map and not meta.get("slug"):
+                    meta["slug"] = slug_map[mid]
+
+    return {"slugs": slug_map}
 
 
 @app.post("/api/position/close")
@@ -996,36 +1017,44 @@ function saveCostLimit() {
   if (el) el.value = saved;
 })();
 
-// Slug cache: resolve market_id → slug via Gamma API (client-side)
+// Slug cache: resolve market_id → slug via backend proxy to Gamma API
 const _slugCache = {};
-const _slugPending = new Set();
-async function _resolveSlug(marketId) {
-  if (!marketId || _slugCache[marketId] !== undefined || _slugPending.has(marketId)) return;
-  _slugPending.add(marketId);
-  try {
-    const r = await fetch('https://gamma-api.polymarket.com/markets?conditionId=' + encodeURIComponent(marketId) + '&limit=1');
-    if (r.ok) {
-      const data = await r.json();
-      if (data && data.length && data[0].slug) {
-        _slugCache[marketId] = data[0].slug;
-        // Also push to backend so future loads are instant
-        fetch('/api/slug/backfill', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({market_id: marketId, slug: data[0].slug})
-        }).catch(() => {});
-      } else {
-        _slugCache[marketId] = '';
-      }
-    }
-  } catch(e) { _slugCache[marketId] = ''; }
-  _slugPending.delete(marketId);
-}
+let _slugResolveQueued = false;
+const _slugQueue = new Set();
 function getSlug(marketId, serverSlug) {
   if (serverSlug) { _slugCache[marketId] = serverSlug; return serverSlug; }
   if (_slugCache[marketId]) return _slugCache[marketId];
-  _resolveSlug(marketId);  // fire-and-forget; will be available next refresh
+  if (marketId) _slugQueue.add(marketId);
+  if (!_slugResolveQueued && _slugQueue.size > 0) {
+    _slugResolveQueued = true;
+    setTimeout(_flushSlugQueue, 100);
+  }
   return '';
+}
+async function _flushSlugQueue() {
+  const ids = [..._slugQueue];
+  _slugQueue.clear();
+  _slugResolveQueued = false;
+  if (!ids.length) return;
+  try {
+    const r = await fetch('/api/slugs/resolve', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({market_ids: ids})
+    });
+    if (r.ok) {
+      const d = await r.json();
+      for (const [mid, slug] of Object.entries(d.slugs || {})) {
+        _slugCache[mid] = slug;
+      }
+      // Re-render tables now that we have slugs
+      if (Object.keys(d.slugs || {}).length > 0) {
+        updatePositions();
+        updateTrades();
+        updateEstimatesTable();
+      }
+    }
+  } catch(e) {}
 }
 function polyUrl(slug) { return slug ? 'https://polymarket.com/event/' + slug : ''; }
 function marketLink(question, slug) {
