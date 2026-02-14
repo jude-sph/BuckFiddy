@@ -175,6 +175,7 @@ def _price_update_loop():
                 _live_state["positions"] = [
                     {
                         "position_id": p.position_id,
+                        "market_id": p.market_id,
                         "market_question": p.market_question,
                         "outcome": p.outcome,
                         "size": p.size,
@@ -322,6 +323,7 @@ def api_positions():
     return [
         {
             "position_id": r["position_id"],
+            "market_id": r["market_id"],
             "market_question": r["market_question"],
             "outcome": r["outcome"],
             "size": r["size"],
@@ -382,6 +384,7 @@ def api_trades():
 
         result.append({
             "trade_id": r["trade_id"],
+            "market_id": r["market_id"],
             "outcome": r["outcome"],
             "side": r["side"],
             "price": r["price"],
@@ -410,6 +413,7 @@ def api_estimates():
     return [
         {
             "id": r["id"],
+            "market_id": r["market_id"],
             "market_question": r["market_question"] if "market_question" in r.keys() else "",
             "slug": r["slug"] if "slug" in r.keys() else "",
             "outcome": r["outcome"],
@@ -685,6 +689,26 @@ def api_agent_single():
         agent_thread = threading.Thread(target=a.run_single_cycle, daemon=True, name="buckfiddy-single")
         agent_thread.start()
     return {"status": "started_single"}
+
+
+@app.post("/api/slug/backfill")
+def api_slug_backfill(body: dict):
+    """Accept a slug from the frontend and persist it to the DB."""
+    market_id = body.get("market_id")
+    slug = body.get("slug")
+    if not market_id or not slug:
+        return JSONResponse({"error": "market_id and slug required"}, status_code=400)
+    s = get_store()
+    s.execute("UPDATE positions SET slug = ? WHERE market_id = ? AND (slug IS NULL OR slug = '')", (slug, market_id))
+    s.execute("UPDATE estimates SET slug = ? WHERE market_id = ? AND (slug IS NULL OR slug = '')", (slug, market_id))
+    s.commit()
+    # Also update in-memory token_meta
+    a = get_or_create_agent()
+    if hasattr(a.backend, '_token_meta'):
+        for meta in a.backend._token_meta.values():
+            if meta.get("market_id") == market_id and not meta.get("slug"):
+                meta["slug"] = slug
+    return {"status": "ok"}
 
 
 @app.post("/api/position/close")
@@ -972,6 +996,37 @@ function saveCostLimit() {
   if (el) el.value = saved;
 })();
 
+// Slug cache: resolve market_id → slug via Gamma API (client-side)
+const _slugCache = {};
+const _slugPending = new Set();
+async function _resolveSlug(marketId) {
+  if (!marketId || _slugCache[marketId] !== undefined || _slugPending.has(marketId)) return;
+  _slugPending.add(marketId);
+  try {
+    const r = await fetch('https://gamma-api.polymarket.com/markets?conditionId=' + encodeURIComponent(marketId) + '&limit=1');
+    if (r.ok) {
+      const data = await r.json();
+      if (data && data.length && data[0].slug) {
+        _slugCache[marketId] = data[0].slug;
+        // Also push to backend so future loads are instant
+        fetch('/api/slug/backfill', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({market_id: marketId, slug: data[0].slug})
+        }).catch(() => {});
+      } else {
+        _slugCache[marketId] = '';
+      }
+    }
+  } catch(e) { _slugCache[marketId] = ''; }
+  _slugPending.delete(marketId);
+}
+function getSlug(marketId, serverSlug) {
+  if (serverSlug) { _slugCache[marketId] = serverSlug; return serverSlug; }
+  if (_slugCache[marketId]) return _slugCache[marketId];
+  _resolveSlug(marketId);  // fire-and-forget; will be available next refresh
+  return '';
+}
 function polyUrl(slug) { return slug ? 'https://polymarket.com/event/' + slug : ''; }
 function marketLink(question, slug) {
   const text = (question || '').replace(/</g, '&lt;');
@@ -1298,7 +1353,7 @@ async function updatePositions() {
       const id = p.position_id;
       const expanded = expandedPositions.has(id);
       return `<tr class="border-t border-slate-800 cursor-pointer hover:bg-slate-800/30" onclick="togglePosition('${id}')">
-      <td class="py-2 pr-3 max-w-[200px] truncate" title="${(p.market_question || '').replace(/"/g, '&quot;')}">${marketLink(p.market_question, p.slug)}</td>
+      <td class="py-2 pr-3 max-w-[200px] truncate" title="${(p.market_question || '').replace(/"/g, '&quot;')}">${marketLink(p.market_question, getSlug(p.market_id, p.slug))}</td>
       <td><span class="px-2 py-0.5 rounded text-xs font-medium badge-yes">${p.outcome}</span></td>
       <td class="text-right font-mono">${p.size.toFixed(1)}</td>
       <td class="text-right font-mono">${(p.avg_entry_price * 100).toFixed(1)}%</td>
@@ -1343,7 +1398,7 @@ async function updateTrades() {
       const expanded = expandedTrades.has(id);
       return `<tr class="border-t border-slate-800 ${t.reasoning ? 'cursor-pointer' : ''}" ${t.reasoning ? 'onclick="toggleTrade(\\''+id+'\\')"' : ''}>
       <td class="py-2 text-slate-400">${fmtTime(t.executed_at)}</td>
-      <td class="max-w-[250px] truncate" title="${(t.market_question || '').replace(/"/g, '&quot;')}">${marketLink(t.market_question || t.outcome, t.slug)}</td>
+      <td class="max-w-[250px] truncate" title="${(t.market_question || '').replace(/"/g, '&quot;')}">${marketLink(t.market_question || t.outcome, getSlug(t.market_id, t.slug))}</td>
       <td><span class="px-2 py-0.5 rounded text-xs font-medium ${t.side === 'BUY' ? 'badge-buy' : 'badge-sell'}">${t.side} ${t.outcome}</span></td>
       <td class="text-right font-mono">$${t.price.toFixed(3)}</td>
       <td class="text-right font-mono">${t.entry_price ? '$' + (t.entry_price * t.size).toFixed(2) : t.size.toFixed(1)}</td>
@@ -1374,7 +1429,7 @@ async function updateEstimatesTable() {
       const expanded = expandedEstimates.has(id);
       return `<tr class="border-t border-slate-800 cursor-pointer" onclick="toggleEstimate('${id}')">
       <td class="py-2 text-slate-400">${fmtTime(e.created_at)}</td>
-      <td class="max-w-[350px] truncate" title="${(e.market_question || '').replace(/"/g, '&quot;')}">${e.market_question ? marketLink(e.market_question, e.slug) : '<span class=\\'text-slate-600\\'>—</span>'}</td>
+      <td class="max-w-[350px] truncate" title="${(e.market_question || '').replace(/"/g, '&quot;')}">${e.market_question ? marketLink(e.market_question, getSlug(e.market_id, e.slug)) : '<span class=\\'text-slate-600\\'>—</span>'}</td>
       <td><span class="px-2 py-0.5 rounded text-xs font-medium badge-yes">${e.outcome}</span></td>
       <td class="text-right font-mono">${(e.claude_estimate * 100).toFixed(1)}%</td>
       <td class="text-right font-mono">${(e.market_midpoint * 100).toFixed(1)}%</td>
