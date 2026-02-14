@@ -365,6 +365,19 @@ class ToolDispatcher:
                 # Store end_date in our own metadata cache for position reviews
                 self._market_end_dates[m.market_id] = m.end_date
 
+        # Backfill slugs for existing positions/estimates from this scan
+        for m in markets:
+            if m.slug:
+                self.store.execute(
+                    "UPDATE positions SET slug = ? WHERE market_id = ? AND (slug IS NULL OR slug = '')",
+                    (m.slug, m.market_id),
+                )
+                self.store.execute(
+                    "UPDATE estimates SET slug = ? WHERE market_id = ? AND (slug IS NULL OR slug = '')",
+                    (m.slug, m.market_id),
+                )
+        self.store.commit()
+
         # Return markets WITHOUT prices
         return {
             "markets": [

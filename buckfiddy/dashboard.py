@@ -104,7 +104,6 @@ def _backfill_slugs():
     global _slugs_backfilled
     if _slugs_backfilled:
         return
-    _slugs_backfilled = True
 
     try:
         import requests as _req
@@ -153,10 +152,12 @@ def _backfill_slugs():
                 if mid in slug_map and not meta.get("slug"):
                     meta["slug"] = slug_map[mid]
 
+        _slugs_backfilled = True
         log = logging.getLogger("buckfiddy.slug_backfill")
         log.info(f"Backfilled slugs for {len(slug_map)} markets")
     except Exception as e:
-        logging.getLogger("buckfiddy.slug_backfill").debug(f"Slug backfill failed: {e}")
+        _slugs_backfilled = True  # Don't retry on error — will be filled by next scan
+        logging.getLogger("buckfiddy.slug_backfill").warning(f"Slug backfill failed: {e}")
 
 
 def _price_update_loop():
@@ -978,7 +979,7 @@ function polyUrl(slug) { return slug ? 'https://polymarket.com/event/' + slug : 
 function marketLink(question, slug) {
   const text = (question || '').replace(/</g, '&lt;');
   if (!slug) return text;
-  return '<a href="' + polyUrl(slug) + '" target="_blank" rel="noopener" class="hover:text-blue-400 transition-colors" onclick="event.stopPropagation()">' + text + ' <span class="text-slate-600 text-[10px]">&#8599;</span></a>';
+  return '<a href="' + polyUrl(slug) + '" target="_blank" rel="noopener" class="text-blue-400 hover:text-blue-300 hover:underline transition-colors" onclick="event.stopPropagation()">' + text + ' <span class="text-blue-600 text-[10px]">&#8599;</span></a>';
 }
 function fmtUsd(v) { return '$' + Number(v).toFixed(2); }
 function fmtPct(v) { return (v >= 0 ? '+' : '') + Number(v).toFixed(1) + '%'; }
