@@ -93,7 +93,11 @@ class AgentLoop:
         self.settings = settings
         self.dispatcher = ToolDispatcher(backend, scanner, settings)
         self.store = StateStore(settings.DB_PATH)
-        self.cycle_count = 0
+        # Resume cycle numbering from the database
+        row = self.store.fetchone(
+            "SELECT COALESCE(MAX(cycle_number), 0) AS max_cycle FROM cycle_log"
+        )
+        self.cycle_count = row["max_cycle"] if row else 0
         self._stop_event = threading.Event()
         self.running = False
         self.current_cycle_type = ""   # "research" | "check" | ""
