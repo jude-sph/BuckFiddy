@@ -225,12 +225,10 @@ def api_summary():
         total_value = cash
         num_pos = 0
 
-    starting = 100.0
-    first_snap = s.fetchone(
-        "SELECT equity FROM equity_snapshots ORDER BY id ASC LIMIT 1"
-    )
-    if first_snap:
-        starting = first_snap["equity"]
+    # Starting balance: use config value (initial deposit), not first equity snapshot
+    # (first snapshot is taken AFTER cycle 1, which already includes API costs and market moves)
+    a = get_or_create_agent()
+    starting = a.settings.STARTING_BALANCE
 
     # Read live API cost from api_usage (updated mid-cycle)
     live_cost = s.fetchone(
@@ -258,7 +256,6 @@ def api_summary():
     )
 
     # Use agent's live settings (reflects model switches) instead of fresh Settings()
-    a = get_or_create_agent()
     live_settings = a.settings
 
     # Model names (short form for display)
