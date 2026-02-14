@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     MAX_OPEN_POSITIONS: int = 10
     MAX_NEW_ESTIMATES_PER_CYCLE: int = 2  # Hard limit on new market estimates per cycle
     STOP_LOSS_PCT: float = 0.50
+    TAKE_PROFIT_PCT: float = 0.40
     STARTING_BALANCE: float = 100.0
 
     # Market filters

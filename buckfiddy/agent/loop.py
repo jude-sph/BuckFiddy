@@ -8,11 +8,13 @@ from datetime import datetime, timezone
 import anthropic
 
 from buckfiddy.agent.prompts import (
+    build_close_review_prompt,
     build_market_selection_prompt,
     build_position_review_prompt,
     build_research_prompt,
 )
 from buckfiddy.agent.tools import (
+    CLOSE_REVIEW_TOOLS,
     POSITION_REVIEW_TOOLS,
     RESEARCH_TRADE_TOOLS,
     WEB_SEARCH_TOOL,
@@ -20,7 +22,7 @@ from buckfiddy.agent.tools import (
 )
 from buckfiddy.config import Settings
 from buckfiddy.markets.scanner import MarketScanner
-from buckfiddy.risk.stoploss import check_stop_losses
+from buckfiddy.risk.stoploss import check_risk_guards
 from buckfiddy.state.store import StateStore
 from buckfiddy.trading.base import TradingBackend
 
@@ -207,12 +209,14 @@ class AgentLoop:
         self.current_phase = "Starting"
         logger.info(f"=== Cycle {self.cycle_count} ({self.current_cycle_type}) starting ===")
 
-        # Hard stop loss check (outside Claude's control)
-        stop_loss_results = check_stop_losses(
-            self.backend, self.settings.STOP_LOSS_PCT
+        # Hard risk guards (outside Claude's control)
+        guard_results = check_risk_guards(
+            self.backend,
+            self.settings.STOP_LOSS_PCT,
+            self.settings.TAKE_PROFIT_PCT,
         )
-        for result in stop_loss_results:
-            logger.warning(f"STOP LOSS: {result.message}")
+        for gr in guard_results:
+            logger.warning(f"{gr.guard_type.upper()}: {gr.message}")
 
         # Check and fill any open limit orders (mock backend only)
         if hasattr(self.backend, "check_open_orders"):
@@ -226,7 +230,7 @@ class AgentLoop:
             else:
                 summary = self._run_check_cycle(usage)
         finally:
-            self._log_cycle(summary, len(stop_loss_results), usage)
+            self._log_cycle(summary, len(guard_results), usage)
 
     def _run_research_cycle(self, usage: CycleUsage) -> str:
         summary_parts = []
@@ -311,7 +315,20 @@ class AgentLoop:
         logger.info(
             f"Check cycle: reviewing {len(wallet.positions)} positions"
         )
-        return self._phase_position_review(wallet, usage)
+        summary = self._phase_position_review(wallet, usage)
+
+        # Escalation: if Haiku flagged any positions for closing, Opus reviews
+        pending = self.dispatcher._pending_close_reviews
+        if pending:
+            logger.info(
+                f"Escalating {len(pending)} position(s) to senior model for close review"
+            )
+            for i, review in enumerate(pending):
+                self.current_phase = f"Close Review ({i+1}/{len(pending)})"
+                review_summary = self._phase_close_review(review, usage)
+                summary += f"\n\n[Close Review] {review_summary}"
+
+        return summary
 
     # ── Phase implementations ────────────────────────────────────────
 
@@ -343,8 +360,9 @@ class AgentLoop:
             "For EACH position above, call `submit_probability_estimate` with "
             "your fresh probability estimate. You can submit estimates for "
             "multiple positions in a single response.\n"
-            "If the system says ACTION REQUIRED — CLOSE, call `close_position` "
-            "with the position_id and estimate_id. If it says HOLD, leave it alone."
+            "The system will tell you whether to HOLD or flag for senior review. "
+            "You do not need to take any action on flagged positions — a senior "
+            "model will handle close decisions."
         )
 
         messages = [{"role": "user", "content": "\n".join(lines)}]
@@ -356,6 +374,49 @@ class AgentLoop:
             usage=usage,
             max_turns=8,
             phase_label="position_review",
+        )
+
+    def _phase_close_review(self, review: dict, usage: CycleUsage) -> str:
+        """Opus reviews a position flagged for closure by Haiku."""
+        model = self.settings.CLAUDE_MODEL_RESEARCH
+        system = build_close_review_prompt(self.settings)
+
+        user_msg = (
+            f"A routine position check flagged this position for potential closure.\n\n"
+            f"**Your position:**\n"
+            f"- Position ID: {review['position_id']}\n"
+            f"- Market: \"{review['market_question']}\"\n"
+            f"- Outcome held: {review['outcome']}\n"
+            f"- Shares: {review['shares']:.1f}\n"
+            f"- Market end date: {review['end_date']}\n\n"
+            f"**Junior model's assessment:**\n"
+            f"- Estimated {review['outcome']} probability: {review['estimate']:.3f}\n"
+            f"- Current market price: {review['midpoint']:.3f}\n"
+            f"- Edge: {review['edge']:+.1%} (flipped against position)\n"
+            f"- Reasoning: {review['reasoning']}\n\n"
+            f"**Your decision:**\n"
+            f"Use `web_search` if you need to verify information. "
+            f"If you agree the position should be closed, call `close_position` "
+            f"with position_id={review['position_id']} and "
+            f"estimate_id={review['estimate_id']}. "
+            f"If you disagree, explain why and take no action."
+        )
+
+        messages = [{"role": "user", "content": user_msg}]
+        tools = CLOSE_REVIEW_TOOLS + [WEB_SEARCH_TOOL]
+
+        logger.info(
+            f"Close review: Opus evaluating '{review['market_question'][:50]}' "
+            f"(edge: {review['edge']:+.1%})"
+        )
+        return self._run_conversation(
+            model=model,
+            system_prompt=system,
+            tools=tools,
+            messages=messages,
+            usage=usage,
+            max_turns=5,
+            phase_label="close_review",
         )
 
     def _phase_market_selection(

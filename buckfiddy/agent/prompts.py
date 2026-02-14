@@ -102,16 +102,39 @@ For each position below, you must:
 2. Estimate the true probability based on your current knowledge (NO anchoring to previous estimates)
 3. Call `submit_probability_estimate` with your fresh estimate and brief reasoning
 
-The system will tell you whether to HOLD or CLOSE:
-- **"ACTION REQUIRED — CLOSE POSITION"**: Your estimate has FLIPPED against your position. Call `close_position` immediately with the estimate_id provided.
-- **"HOLD"**: Position is still directionally correct. Do NOT close.
+The system will tell you what the status is:
+- **"FLAGGED FOR SENIOR REVIEW"**: Your estimate has flipped against your position. A senior model will review and decide. No action needed from you.
+- **"HOLD"**: Position is still directionally correct. No action needed.
 
-**TIME HORIZON**: For markets resolving weeks/months out, do NOT close based on small fluctuations. Only close if your fundamental thesis has changed or the edge has genuinely flipped.
+You do NOT have the ability to close positions. Your job is to provide honest probability estimates. A senior model handles close decisions.
+
+**TIME HORIZON**: For markets resolving weeks/months out, do NOT panic over small fluctuations. Give honest estimates based on fundamentals, not noise.
 
 Rules:
 - Never risk more than {settings.MAX_POSITION_PCT * 100:.0f}% of balance on any position
 - Stop loss at {settings.STOP_LOSS_PCT * 100:.0f}% runs independently — you cannot override it
 - Be honest. Overconfidence kills accounts."""
+
+
+def build_close_review_prompt(settings: Settings) -> str:
+    return f"""You are BuckFiddy's senior risk manager. A routine position check has flagged a position for potential closure.
+
+Your job is to make the final call: CLOSE or HOLD.
+
+Guidelines:
+- You receive the junior model's probability estimate and reasoning
+- Use `web_search` if you need to verify current information or check for recent developments
+- Consider the TIME HORIZON — if the market resolves weeks/months out, small price movements are noise
+- Only close if you genuinely believe the edge has flipped or the fundamental thesis has changed
+- If the junior model's reasoning seems sound and well-supported, trust it
+- If the reasoning seems shallow, uncertain, or based on stale information, default to HOLD
+
+To close: call `close_position` with the position_id and estimate_id provided
+To hold: simply explain why you disagree and take no action
+
+Risk rules:
+- Stop loss at {settings.STOP_LOSS_PCT * 100:.0f}% runs independently — catastrophic losses are already handled
+- Your role is to prevent premature closures from noisy estimates, not to override safety mechanisms"""
 
 
 def build_market_selection_prompt(_settings: Settings) -> str:

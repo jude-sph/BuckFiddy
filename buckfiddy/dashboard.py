@@ -393,6 +393,8 @@ def api_agent_status():
         "markets_per_cycle": a.settings.MAX_NEW_ESTIMATES_PER_CYCLE if a else settings.MAX_NEW_ESTIMATES_PER_CYCLE,
         "edge_threshold": a.settings.EDGE_THRESHOLD if a else settings.EDGE_THRESHOLD,
         "market_cooldown": (a.settings.MARKET_COOLDOWN_SECONDS if a else settings.MARKET_COOLDOWN_SECONDS) // 60,
+        "stop_loss_pct": a.settings.STOP_LOSS_PCT if a else settings.STOP_LOSS_PCT,
+        "take_profit_pct": a.settings.TAKE_PROFIT_PCT if a else settings.TAKE_PROFIT_PCT,
         "next_check_secs": a.next_check_secs if a else 0,
         "next_research_secs": a.next_research_secs if a else 0,
     }
@@ -492,6 +494,8 @@ def api_timing_update(body: dict):
     markets = body.get("markets_per_cycle")
     edge = body.get("edge_threshold")
     cooldown = body.get("market_cooldown")
+    stop_loss = body.get("stop_loss")
+    take_profit = body.get("take_profit")
 
     a = get_or_create_agent()
     if full is not None:
@@ -509,6 +513,12 @@ def api_timing_update(body: dict):
     if cooldown is not None:
         val = max(0, int(cooldown))  # seconds
         a.settings.MARKET_COOLDOWN_SECONDS = val
+    if stop_loss is not None:
+        val = max(0.10, min(0.90, float(stop_loss)))  # 10-90%
+        a.settings.STOP_LOSS_PCT = val
+    if take_profit is not None:
+        val = max(0.10, min(0.90, float(take_profit)))  # 10-90%
+        a.settings.TAKE_PROFIT_PCT = val
 
     return {
         "status": "ok",
@@ -517,6 +527,8 @@ def api_timing_update(body: dict):
         "markets_per_cycle": a.settings.MAX_NEW_ESTIMATES_PER_CYCLE,
         "edge_threshold": a.settings.EDGE_THRESHOLD,
         "market_cooldown": a.settings.MARKET_COOLDOWN_SECONDS // 60,
+        "stop_loss": a.settings.STOP_LOSS_PCT,
+        "take_profit": a.settings.TAKE_PROFIT_PCT,
     }
 
 
@@ -662,25 +674,44 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <p class="text-sm text-slate-500 mt-1">Autonomous Polymarket Trading Agent
         <span id="backend-badge" class="ml-2 px-2 py-0.5 rounded text-xs font-medium bg-blue-900/50 text-blue-400 border border-blue-800">MOCK</span>
       </p>
-      <div class="flex items-center gap-3 mt-1 flex-wrap">
-        <span class="text-xs text-slate-600">Fast:</span>
-        <select id="model-fast-select" onchange="switchModel('fast', this.value)" class="px-2 py-0.5 text-xs text-slate-300 bg-slate-800 border border-slate-700 rounded cursor-pointer"></select>
-        <span class="text-xs text-slate-600">Research:</span>
-        <select id="model-research-select" onchange="switchModel('research', this.value)" class="px-2 py-0.5 text-xs text-slate-300 bg-slate-800 border border-slate-700 rounded cursor-pointer"></select>
-        <span class="text-slate-700 mx-1">|</span>
-        <span class="text-xs text-slate-600">Research every</span>
-        <input id="timing-full" type="number" min="1" step="1" class="w-12 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateTiming()">
-        <span class="text-xs text-slate-600">min, checks every</span>
-        <input id="timing-light" type="number" min="1" step="1" class="w-12 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateTiming()">
-        <span class="text-xs text-slate-600">min</span>
-        <span class="text-slate-700 mx-1">|</span>
-        <span class="text-xs text-slate-600">Research</span>
-        <input id="timing-markets" type="number" min="1" max="5" step="1" class="w-12 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateTiming()">
-        <span class="text-xs text-slate-600">markets/cycle, edge</span>
-        <input id="timing-edge" type="number" min="1" max="50" step="1" class="w-12 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateTiming()">
-        <span class="text-xs text-slate-600">%, cooldown</span>
-        <input id="timing-cooldown" type="number" min="0" max="1440" step="30" class="w-14 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateTiming()">
-        <span class="text-xs text-slate-600">min</span>
+      <div class="mt-2 space-y-1.5 text-xs">
+        <div class="flex items-center gap-4">
+          <span class="w-14 text-slate-500 font-medium shrink-0">Models</span>
+          <div class="flex items-center gap-1"><span class="text-slate-500">Fast</span>
+            <select id="model-fast-select" onchange="switchModel('fast', this.value)" class="px-2 py-0.5 text-xs text-slate-300 bg-slate-800 border border-slate-700 rounded cursor-pointer"></select></div>
+          <div class="flex items-center gap-1"><span class="text-slate-500">Research</span>
+            <select id="model-research-select" onchange="switchModel('research', this.value)" class="px-2 py-0.5 text-xs text-slate-300 bg-slate-800 border border-slate-700 rounded cursor-pointer"></select></div>
+        </div>
+        <div class="flex items-center gap-4">
+          <span class="w-14 text-slate-500 font-medium shrink-0">Timing</span>
+          <div class="flex items-center gap-1"><span class="text-slate-500">Research every</span>
+            <input id="timing-full" type="number" min="1" step="1" class="w-12 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateSettings()">
+            <span class="text-slate-600">min</span></div>
+          <div class="flex items-center gap-1"><span class="text-slate-500">Check every</span>
+            <input id="timing-light" type="number" min="1" step="1" class="w-12 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateSettings()">
+            <span class="text-slate-600">min</span></div>
+        </div>
+        <div class="flex items-center gap-4">
+          <span class="w-14 text-slate-500 font-medium shrink-0">Trading</span>
+          <div class="flex items-center gap-1"><span class="text-slate-500">Markets</span>
+            <input id="timing-markets" type="number" min="1" max="5" step="1" class="w-10 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateSettings()">
+            <span class="text-slate-600">/cycle</span></div>
+          <div class="flex items-center gap-1"><span class="text-slate-500">Min edge</span>
+            <input id="timing-edge" type="number" min="1" max="50" step="1" class="w-10 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateSettings()">
+            <span class="text-slate-600">%</span></div>
+          <div class="flex items-center gap-1"><span class="text-slate-500">Market research cooldown</span>
+            <input id="timing-cooldown" type="number" min="0" max="1440" step="30" class="w-14 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateSettings()">
+            <span class="text-slate-600">min</span></div>
+        </div>
+        <div class="flex items-center gap-4">
+          <span class="w-14 text-slate-500 font-medium shrink-0">Risk</span>
+          <div class="flex items-center gap-1"><span class="text-slate-500">Stop loss</span>
+            <input id="setting-stoploss" type="number" min="10" max="90" step="5" class="w-12 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateSettings()">
+            <span class="text-slate-600">%</span></div>
+          <div class="flex items-center gap-1"><span class="text-slate-500">Take profit</span>
+            <input id="setting-takeprofit" type="number" min="10" max="90" step="5" class="w-12 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateSettings()">
+            <span class="text-slate-600">%</span></div>
+        </div>
       </div>
     </div>
   </div>
@@ -958,6 +989,12 @@ async function updateAgentStatus() {
   if (d.market_cooldown != null && !$('timing-cooldown').matches(':focus')) {
     $('timing-cooldown').value = d.market_cooldown;
   }
+  if (d.stop_loss_pct != null && !$('setting-stoploss').matches(':focus')) {
+    $('setting-stoploss').value = Math.round(d.stop_loss_pct * 100);
+  }
+  if (d.take_profit_pct != null && !$('setting-takeprofit').matches(':focus')) {
+    $('setting-takeprofit').value = Math.round(d.take_profit_pct * 100);
+  }
 
   $('btn-start').classList.toggle('hidden', running);
   $('btn-single-check').classList.toggle('hidden', running);
@@ -1210,16 +1247,26 @@ async function switchModel(role, modelId) {
   }
 }
 
-async function updateTiming() {
+async function updateSettings() {
   const fullMin = parseInt($('timing-full').value) || 120;
   const lightMin = parseInt($('timing-light').value) || 30;
   const markets = parseInt($('timing-markets').value) || 2;
   const edgePct = parseInt($('timing-edge').value) || 8;
   const cooldownMin = parseInt($('timing-cooldown').value) || 0;
+  const stopLoss = parseInt($('setting-stoploss').value) || 50;
+  const takeProfit = parseInt($('setting-takeprofit').value) || 40;
   await fetch('/api/timing/update', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ full_interval: fullMin * 60, light_interval: lightMin * 60, markets_per_cycle: markets, edge_threshold: edgePct / 100, market_cooldown: cooldownMin * 60 })
+    body: JSON.stringify({
+      full_interval: fullMin * 60,
+      light_interval: lightMin * 60,
+      markets_per_cycle: markets,
+      edge_threshold: edgePct / 100,
+      market_cooldown: cooldownMin * 60,
+      stop_loss: stopLoss / 100,
+      take_profit: takeProfit / 100
+    })
   });
 }
 

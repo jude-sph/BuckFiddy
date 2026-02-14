@@ -242,6 +242,10 @@ _TOOL_BY_NAME = {t["name"]: t for t in TOOLS}
 POSITION_REVIEW_TOOLS = [
     _TOOL_BY_NAME["review_position"],
     _TOOL_BY_NAME["submit_probability_estimate"],
+    # close_position removed — Haiku can flag but not close; Opus confirms
+]
+
+CLOSE_REVIEW_TOOLS = [
     _TOOL_BY_NAME["close_position"],
 ]
 
@@ -263,6 +267,7 @@ class ToolDispatcher:
         self._market_end_dates: dict[str, str] = {}  # market_id -> end_date
         self._new_estimates_this_cycle: int = 0  # Counter for new market estimates
         self._last_estimate: dict[str, dict] = {}  # market_id -> last estimate info
+        self._pending_close_reviews: list[dict] = []  # Positions flagged for Opus review
 
     def _find_opposite_token(self, token_id: str, market_id: str) -> tuple[str, str] | None:
         """Find the opposite token for a binary market.
@@ -277,6 +282,7 @@ class ToolDispatcher:
     def reset_cycle_counters(self):
         """Reset per-cycle counters. Call at the start of each cycle."""
         self._new_estimates_this_cycle = 0
+        self._pending_close_reviews = []
 
     def dispatch(self, tool_name: str, tool_input: dict) -> str:
         """Execute a tool and return the JSON result string."""
@@ -447,14 +453,30 @@ class ToolDispatcher:
         suggested_amount = round(balance * suggested_pct, 2)
 
         if held_position and tradeable and edge < 0:
-            # Claude holds this outcome but now thinks it's OVERVALUED — CLOSE IT
+            # Claude holds this outcome but now thinks it's OVERVALUED
+            # Flag for Opus review instead of closing directly
+            end_date = self._market_end_dates.get(market_id, "unknown")
+            self._pending_close_reviews.append({
+                "position_id": held_position.position_id,
+                "market_id": market_id,
+                "token_id": token_id,
+                "outcome": outcome,
+                "market_question": market_question,
+                "estimate": estimate,
+                "midpoint": midpoint,
+                "edge": edge,
+                "reasoning": reasoning,
+                "estimate_id": estimate_id,
+                "shares": held_position.size,
+                "end_date": end_date,
+            })
             recommendation = (
-                f"ACTION REQUIRED — CLOSE POSITION NOW. You hold "
+                f"FLAGGED FOR SENIOR REVIEW — You hold "
                 f"{held_position.size:.1f} shares of {outcome} but your new "
                 f"estimate ({estimate:.3f}) is BELOW market ({midpoint:.3f}). "
                 f"The edge has FLIPPED against you ({edge:+.1%}). "
-                f"Call close_position with position_id="
-                f"{held_position.position_id} and estimate_id={estimate_id} immediately."
+                f"A senior model will review this position and decide whether "
+                f"to close. No action needed from you."
             )
         elif held_position and not tradeable:
             # Edge has narrowed but not flipped — hold for long-horizon bets
