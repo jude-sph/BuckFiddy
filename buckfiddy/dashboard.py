@@ -1017,50 +1017,11 @@ function saveCostLimit() {
   if (el) el.value = saved;
 })();
 
-// Slug cache: resolve market_id → slug via backend proxy to Gamma API
-const _slugCache = {};
-let _slugResolveQueued = false;
-const _slugQueue = new Set();
-function getSlug(marketId, serverSlug) {
-  if (serverSlug) { _slugCache[marketId] = serverSlug; return serverSlug; }
-  if (_slugCache[marketId]) return _slugCache[marketId];
-  if (marketId) _slugQueue.add(marketId);
-  if (!_slugResolveQueued && _slugQueue.size > 0) {
-    _slugResolveQueued = true;
-    setTimeout(_flushSlugQueue, 100);
-  }
-  return '';
-}
-async function _flushSlugQueue() {
-  const ids = [..._slugQueue];
-  _slugQueue.clear();
-  _slugResolveQueued = false;
-  if (!ids.length) return;
-  try {
-    const r = await fetch('/api/slugs/resolve', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({market_ids: ids})
-    });
-    if (r.ok) {
-      const d = await r.json();
-      for (const [mid, slug] of Object.entries(d.slugs || {})) {
-        _slugCache[mid] = slug;
-      }
-      // Re-render tables now that we have slugs
-      if (Object.keys(d.slugs || {}).length > 0) {
-        updatePositions();
-        updateTrades();
-        updateEstimatesTable();
-      }
-    }
-  } catch(e) {}
-}
-function polyUrl(slug) { return slug ? 'https://polymarket.com/event/' + slug : ''; }
-function marketLink(question, slug) {
+function marketLink(question) {
   const text = (question || '').replace(/</g, '&lt;');
-  if (!slug) return text;
-  return '<a href="' + polyUrl(slug) + '" target="_blank" rel="noopener" class="text-blue-400 hover:text-blue-300 hover:underline transition-colors" onclick="event.stopPropagation()">' + text + ' <span class="text-blue-600 text-[10px]">&#8599;</span></a>';
+  if (!question) return text;
+  const q = encodeURIComponent('site:polymarket.com ' + question);
+  return '<a href="https://www.google.com/search?q=' + q + '" target="_blank" rel="noopener" class="text-blue-400 hover:text-blue-300 hover:underline transition-colors" onclick="event.stopPropagation()">' + text + ' <span class="text-blue-600 text-[10px]">&#8599;</span></a>';
 }
 function fmtUsd(v) { return '$' + Number(v).toFixed(2); }
 function fmtPct(v) { return (v >= 0 ? '+' : '') + Number(v).toFixed(1) + '%'; }
@@ -1382,7 +1343,7 @@ async function updatePositions() {
       const id = p.position_id;
       const expanded = expandedPositions.has(id);
       return `<tr class="border-t border-slate-800 cursor-pointer hover:bg-slate-800/30" onclick="togglePosition('${id}')">
-      <td class="py-2 pr-3 max-w-[200px] truncate" title="${(p.market_question || '').replace(/"/g, '&quot;')}">${marketLink(p.market_question, getSlug(p.market_id, p.slug))}</td>
+      <td class="py-2 pr-3 max-w-[200px] truncate" title="${(p.market_question || '').replace(/"/g, '&quot;')}">${marketLink(p.market_question)}</td>
       <td><span class="px-2 py-0.5 rounded text-xs font-medium badge-yes">${p.outcome}</span></td>
       <td class="text-right font-mono">${p.size.toFixed(1)}</td>
       <td class="text-right font-mono">${(p.avg_entry_price * 100).toFixed(1)}%</td>
@@ -1427,7 +1388,7 @@ async function updateTrades() {
       const expanded = expandedTrades.has(id);
       return `<tr class="border-t border-slate-800 ${t.reasoning ? 'cursor-pointer' : ''}" ${t.reasoning ? 'onclick="toggleTrade(\\''+id+'\\')"' : ''}>
       <td class="py-2 text-slate-400">${fmtTime(t.executed_at)}</td>
-      <td class="max-w-[250px] truncate" title="${(t.market_question || '').replace(/"/g, '&quot;')}">${marketLink(t.market_question || t.outcome, getSlug(t.market_id, t.slug))}</td>
+      <td class="max-w-[250px] truncate" title="${(t.market_question || '').replace(/"/g, '&quot;')}">${marketLink(t.market_question || t.outcome)}</td>
       <td><span class="px-2 py-0.5 rounded text-xs font-medium ${t.side === 'BUY' ? 'badge-buy' : 'badge-sell'}">${t.side} ${t.outcome}</span></td>
       <td class="text-right font-mono">$${t.price.toFixed(3)}</td>
       <td class="text-right font-mono">${t.entry_price ? '$' + (t.entry_price * t.size).toFixed(2) : t.size.toFixed(1)}</td>
@@ -1458,7 +1419,7 @@ async function updateEstimatesTable() {
       const expanded = expandedEstimates.has(id);
       return `<tr class="border-t border-slate-800 cursor-pointer" onclick="toggleEstimate('${id}')">
       <td class="py-2 text-slate-400">${fmtTime(e.created_at)}</td>
-      <td class="max-w-[350px] truncate" title="${(e.market_question || '').replace(/"/g, '&quot;')}">${e.market_question ? marketLink(e.market_question, getSlug(e.market_id, e.slug)) : '<span class=\\'text-slate-600\\'>—</span>'}</td>
+      <td class="max-w-[350px] truncate" title="${(e.market_question || '').replace(/"/g, '&quot;')}">${e.market_question ? marketLink(e.market_question) : '<span class=\\'text-slate-600\\'>—</span>'}</td>
       <td><span class="px-2 py-0.5 rounded text-xs font-medium badge-yes">${e.outcome}</span></td>
       <td class="text-right font-mono">${(e.claude_estimate * 100).toFixed(1)}%</td>
       <td class="text-right font-mono">${(e.market_midpoint * 100).toFixed(1)}%</td>
