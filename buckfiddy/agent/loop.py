@@ -357,12 +357,35 @@ class AgentLoop:
 
     # ── Phase implementations ────────────────────────────────────────
 
+    def _lookup_original_reasoning(self, token_id: str) -> dict | None:
+        """Find the original research estimate that led to a position."""
+        row = self.store.fetchone(
+            "SELECT e.claude_estimate, e.market_midpoint, e.edge, e.reasoning, e.id "
+            "FROM trades t JOIN estimates e ON t.estimate_id = e.id "
+            "WHERE t.token_id = ? AND t.side = 'BUY' "
+            "ORDER BY t.executed_at DESC LIMIT 1",
+            (token_id,),
+        )
+        if row:
+            return {
+                "claude_estimate": row["claude_estimate"],
+                "market_midpoint": row["market_midpoint"],
+                "edge": row["edge"],
+                "reasoning": row["reasoning"],
+                "estimate_id": row["id"],
+            }
+        return None
+
     def _phase_position_review(self, wallet, usage: CycleUsage) -> str:
-        """Review all open positions in a single fresh micro-conversation (Haiku)."""
+        """Review all open positions in a single fresh micro-conversation (Haiku).
+
+        Haiku evaluates whether the original thesis still holds, rather than
+        re-estimating probabilities from scratch.
+        """
         model = self.settings.CLAUDE_MODEL_FAST
         system = build_position_review_prompt(self.settings)
 
-        # Build a rich user message with all position details baked in
+        # Build context for each position: original reasoning + current price
         lines = [
             f"Your current balance: ${wallet.balance:.2f}",
             f"You have {len(wallet.positions)} open position(s) to review.\n",
@@ -371,23 +394,70 @@ class AgentLoop:
             end_date = self.dispatcher._market_end_dates.get(
                 pos.market_id, "unknown"
             )
-            lines.append(
-                f"Position {i}:\n"
-                f"  - Position ID: {pos.position_id}\n"
-                f"  - Market ID: {pos.market_id}\n"
-                f"  - Token ID: {pos.token_id}\n"
-                f"  - Market: \"{pos.market_question}\"\n"
-                f"  - Outcome: {pos.outcome}\n"
-                f"  - Shares: {pos.size:.1f}\n"
-                f"  - Market end date: {end_date}\n"
-            )
+
+            # Look up the original research reasoning
+            original = self._lookup_original_reasoning(pos.token_id)
+
+            # Get current market price
+            try:
+                current_price = self.backend.get_market_price(pos.token_id)
+                current_mid = current_price.midpoint
+            except Exception:
+                current_mid = None
+
+            # Compute remaining edge vs original estimate
+            remaining_edge = None
+            if original and current_mid is not None:
+                remaining_edge = original["claude_estimate"] - current_mid
+
+            # Store context for the flag handler and close review
+            self.dispatcher._position_context[pos.position_id] = {
+                "market_id": pos.market_id,
+                "token_id": pos.token_id,
+                "outcome": pos.outcome,
+                "market_question": pos.market_question,
+                "shares": pos.size,
+                "entry_price": pos.avg_entry_price,
+                "current_price": current_mid,
+                "end_date": end_date,
+                "original_estimate": original["claude_estimate"] if original else None,
+                "original_reasoning": original["reasoning"] if original else None,
+                "original_edge": original["edge"] if original else None,
+                "estimate_id": original["estimate_id"] if original else None,
+                "remaining_edge": remaining_edge,
+            }
+
+            # Build the position summary for Haiku
+            pos_lines = [
+                f"Position {i}:",
+                f"  - Position ID: {pos.position_id}",
+                f"  - Market: \"{pos.market_question}\"",
+                f"  - Your bet: {pos.outcome}",
+                f"  - Shares: {pos.size:.1f}",
+                f"  - Entry price: ${pos.avg_entry_price:.3f}",
+                f"  - Market end date: {end_date}",
+            ]
+            if current_mid is not None:
+                pos_lines.append(f"  - Current market price: ${current_mid:.3f}")
+            if original:
+                pos_lines.append(
+                    f"  - Original estimate: {original['claude_estimate']:.1%} "
+                    f"(original edge: {original['edge']:+.1%})"
+                )
+                if remaining_edge is not None:
+                    pos_lines.append(f"  - Remaining edge: {remaining_edge:+.1%}")
+                pos_lines.append(
+                    f"  - Original reasoning: {original['reasoning']}"
+                )
+            else:
+                pos_lines.append("  - Original reasoning: (not available)")
+            lines.append("\n".join(pos_lines) + "\n")
+
         lines.append(
-            "For EACH position above, call `submit_probability_estimate` with "
-            "your fresh probability estimate. You can submit estimates for "
-            "multiple positions in a single response.\n"
-            "The system will tell you whether to HOLD or flag for senior review. "
-            "You do not need to take any action on flagged positions — a senior "
-            "model will handle close decisions."
+            "Review each position above. If everything looks fine, say HOLD for "
+            "each and explain briefly why. If you have a genuine concern about any "
+            "position, call `flag_position_for_review` with the position_id and "
+            "your specific concern."
         )
 
         messages = [{"role": "user", "content": "\n".join(lines)}]
@@ -406,33 +476,67 @@ class AgentLoop:
         model = self.settings.CLAUDE_MODEL_RESEARCH
         system = build_close_review_prompt(self.settings)
 
-        user_msg = (
-            f"A routine position check flagged this position for potential closure.\n\n"
-            f"**Your position:**\n"
-            f"- Position ID: {review['position_id']}\n"
-            f"- Market: \"{review['market_question']}\"\n"
-            f"- Outcome held: {review['outcome']}\n"
-            f"- Shares: {review['shares']:.1f}\n"
-            f"- Market end date: {review['end_date']}\n\n"
-            f"**Junior model's assessment:**\n"
-            f"- Estimated {review['outcome']} probability: {review['estimate']:.3f}\n"
-            f"- Current market price: {review['midpoint']:.3f}\n"
-            f"- Edge: {review['edge']:+.1%} (flipped against position)\n"
-            f"- Reasoning: {review['reasoning']}\n\n"
-            f"**Your decision:**\n"
-            f"Use `web_search` if you need to verify information. "
-            f"If you agree the position should be closed, call `close_position` "
-            f"with position_id={review['position_id']} and "
-            f"estimate_id={review['estimate_id']}. "
-            f"If you disagree, explain why and take no action."
+        # Build context with original reasoning + reviewer's concern
+        sections = [
+            "A routine position check flagged this position for potential closure.\n",
+            "**Your position:**",
+            f"- Position ID: {review['position_id']}",
+            f"- Market: \"{review['market_question']}\"",
+            f"- Outcome held: {review['outcome']}",
+            f"- Shares: {review['shares']:.1f}",
+            f"- Entry price: ${review.get('entry_price', 0):.3f}",
+            f"- Market end date: {review.get('end_date', 'unknown')}",
+        ]
+
+        current_price = review.get("current_price")
+        if current_price is not None:
+            sections.append(f"- Current market price: ${current_price:.3f}")
+
+        remaining_edge = review.get("remaining_edge")
+        if remaining_edge is not None:
+            sections.append(f"- Remaining edge: {remaining_edge:+.1%}")
+
+        # Original research reasoning (the key context for this decision)
+        original_reasoning = review.get("original_reasoning")
+        original_estimate = review.get("original_estimate")
+        if original_reasoning:
+            sections.append(
+                f"\n**Original research reasoning (from when this trade was placed):**\n"
+                f"- Original probability estimate: {original_estimate:.1%}\n"
+                f"- Research: {original_reasoning}"
+            )
+        else:
+            sections.append(
+                "\n**Original research reasoning:** (not available — "
+                "this trade may predate reasoning tracking)"
+            )
+
+        # Reviewer's concern
+        concern = review.get("concern", "No specific concern provided")
+        sections.append(
+            f"\n**Reviewer's concern:**\n{concern}\n"
         )
 
+        # Decision instructions
+        estimate_id = review.get("estimate_id")
+        close_args = f"position_id={review['position_id']}"
+        if estimate_id:
+            close_args += f" and estimate_id={estimate_id}"
+        sections.append(
+            f"**Your decision:**\n"
+            f"Use `web_search` if you need to check for recent developments. "
+            f"If you agree the position should be closed, call `close_position` "
+            f"with {close_args}. "
+            f"If the original thesis still holds, explain why and take no action."
+        )
+
+        user_msg = "\n".join(sections)
         messages = [{"role": "user", "content": user_msg}]
         tools = CLOSE_REVIEW_TOOLS + [WEB_SEARCH_TOOL]
 
         logger.info(
-            f"Close review: Opus evaluating '{review['market_question'][:50]}' "
-            f"(edge: {review['edge']:+.1%})"
+            f"Close review: evaluating '{review['market_question'][:50]}' "
+            f"(concern: {concern[:80]})"
         )
         return self._run_conversation(
             model=model,

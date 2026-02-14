@@ -95,25 +95,38 @@ Be deliberate. Be analytical. Protect your capital. Find edge where others don't
 
 
 def build_position_review_prompt(settings: Settings) -> str:
-    return f"""You are BuckFiddy, reviewing your open prediction market positions. Your balance is your existence — $0 means permanent shutdown.
+    return f"""You are BuckFiddy, performing a routine check on your open prediction market positions.
 
-For each position below, you must:
-1. Consider the market question and the end date
-2. Estimate the true probability based on your current knowledge (NO anchoring to previous estimates)
-3. Call `submit_probability_estimate` with your fresh estimate and brief reasoning
+For each position below, you are given:
+- The market question and your position details
+- The ORIGINAL research reasoning that led to this trade (written by a senior model with web search)
+- The original probability estimate and the current market price
+- The remaining edge (original estimate vs current price)
 
-The system will tell you what the status is:
-- **"FLAGGED FOR SENIOR REVIEW"**: Your estimate has flipped against your position. A senior model will review and decide. No action needed from you.
-- **"HOLD"**: Position is still directionally correct. No action needed.
+Your job is to SANITY CHECK each position — not to re-estimate probabilities from scratch.
 
-You do NOT have the ability to close positions. Your job is to provide honest probability estimates. A senior model handles close decisions.
+For each position, ask yourself:
+1. Does the original reasoning still seem sound and well-supported?
+2. Has the edge clearly disappeared or flipped? (Check the "remaining edge" figure)
+3. Are you aware of any recent events that directly contradict the original thesis?
 
-**TIME HORIZON**: For markets resolving weeks/months out, do NOT panic over small fluctuations. Give honest estimates based on fundamentals, not noise.
+**DEFAULT ACTION IS HOLD.** Only flag a position if you have a GENUINE concern:
+- The original reasoning has an obvious factual flaw
+- The edge has clearly evaporated or flipped (remaining edge near 0% or negative)
+- You know of a specific recent development that undermines the thesis
+
+**DO NOT FLAG** just because:
+- You might estimate the probability slightly differently
+- The market has moved a few percent — that's noise, not signal
+- The time horizon is long and nothing has materially changed
+
+If you have a genuine concern, call `flag_position_for_review` with the position_id and a clear explanation of what looks wrong. A senior model will then decide whether to close.
+
+If everything looks fine, simply say HOLD and move on. You do not need to call any tools for positions you want to hold.
 
 Rules:
-- Never risk more than {settings.MAX_POSITION_PCT * 100:.0f}% of balance on any position
-- Stop loss at {settings.STOP_LOSS_PCT * 100:.0f}% runs independently — you cannot override it
-- Be honest. Overconfidence kills accounts."""
+- Stop loss at {settings.STOP_LOSS_PCT * 100:.0f}% and take profit at {settings.TAKE_PROFIT_PCT * 100:.0f}% run independently as mechanical safeguards
+- Your job is to catch thesis failures, not to manage risk mechanically"""
 
 
 def build_close_review_prompt(settings: Settings) -> str:
@@ -121,20 +134,25 @@ def build_close_review_prompt(settings: Settings) -> str:
 
 Your job is to make the final call: CLOSE or HOLD.
 
-Guidelines:
-- You receive the junior model's probability estimate and reasoning
-- Use `web_search` if you need to verify current information or check for recent developments
-- Consider the TIME HORIZON — if the market resolves weeks/months out, small price movements are noise
-- Only close if you genuinely believe the edge has flipped or the fundamental thesis has changed
-- If the junior model's reasoning seems sound and well-supported, trust it
-- If the reasoning seems shallow, uncertain, or based on stale information, default to HOLD
+You will see:
+- The ORIGINAL research reasoning that led to this trade (your own prior research)
+- The junior reviewer's concern about why this position might need closing
+- The current market price and remaining edge
 
-To close: call `close_position` with the position_id and estimate_id provided
-To hold: simply explain why you disagree and take no action
+Guidelines:
+- **Start from the original reasoning** — it was produced by deep research with web searches. Is it still valid?
+- Use `web_search` if you need to verify whether something has changed since the original research
+- Consider the TIME HORIZON — if the market resolves weeks/months out, small price movements are noise
+- Only close if you can identify a SPECIFIC reason the original thesis is wrong or outdated
+- If the reviewer's concern seems vague, speculative, or based on superficial reasoning, default to HOLD
+- If the original edge has narrowed but not flipped, that often means the market is moving TOWARD your view — that's good, not bad
+
+To close: call `close_position` with the position_id
+To hold: explain why the original thesis still holds and take no action
 
 Risk rules:
-- Stop loss at {settings.STOP_LOSS_PCT * 100:.0f}% runs independently — catastrophic losses are already handled
-- Your role is to prevent premature closures from noisy estimates, not to override safety mechanisms"""
+- Stop loss at {settings.STOP_LOSS_PCT * 100:.0f}% and take profit at {settings.TAKE_PROFIT_PCT * 100:.0f}% run independently as mechanical safeguards
+- Your role is to catch genuine thesis failures, not to second-guess noise"""
 
 
 def build_market_selection_prompt(_settings: Settings) -> str:

@@ -224,6 +224,31 @@ TOOLS = [
             "required": ["position_id"],
         },
     },
+    {
+        "name": "flag_position_for_review",
+        "description": (
+            "Flag a position for senior review if the original thesis may no longer "
+            "hold or the edge has clearly disappeared. Only call this if you have a "
+            "genuine concern — the default is HOLD."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "position_id": {
+                    "type": "string",
+                    "description": "The position ID to flag",
+                },
+                "concern": {
+                    "type": "string",
+                    "description": (
+                        "Why this position should be reviewed — what looks wrong "
+                        "with the original thesis, or why the edge has disappeared"
+                    ),
+                },
+            },
+            "required": ["position_id", "concern"],
+        },
+    },
 ]
 
 # Anthropic server-side web search tool
@@ -240,9 +265,7 @@ WEB_SEARCH_TOOL = {
 _TOOL_BY_NAME = {t["name"]: t for t in TOOLS}
 
 POSITION_REVIEW_TOOLS = [
-    _TOOL_BY_NAME["review_position"],
-    _TOOL_BY_NAME["submit_probability_estimate"],
-    # close_position removed — Haiku can flag but not close; Opus confirms
+    _TOOL_BY_NAME["flag_position_for_review"],
 ]
 
 CLOSE_REVIEW_TOOLS = [
@@ -268,6 +291,7 @@ class ToolDispatcher:
         self._new_estimates_this_cycle: int = 0  # Counter for new market estimates
         self._last_estimate: dict[str, dict] = {}  # market_id -> last estimate info
         self._pending_close_reviews: list[dict] = []  # Positions flagged for Opus review
+        self._position_context: dict[str, dict] = {}  # position_id -> context for reviews
 
     def _find_opposite_token(self, token_id: str, market_id: str) -> tuple[str, str] | None:
         """Find the opposite token for a binary market.
@@ -283,6 +307,7 @@ class ToolDispatcher:
         """Reset per-cycle counters. Call at the start of each cycle."""
         self._new_estimates_this_cycle = 0
         self._pending_close_reviews = []
+        self._position_context = {}
 
     def dispatch(self, tool_name: str, tool_input: dict) -> str:
         """Execute a tool and return the JSON result string."""
@@ -296,6 +321,7 @@ class ToolDispatcher:
             "cancel_all_orders": self._handle_cancel_all_orders,
             "close_position": self._handle_close_position,
             "review_position": self._handle_review_position,
+            "flag_position_for_review": self._handle_flag_position,
         }
 
         handler = handlers.get(tool_name)
@@ -644,4 +670,28 @@ class ToolDispatcher:
             "outcome": position.outcome,
             "shares_held": position.size,
             "market_end_date": end_date,
+        }
+
+    def _handle_flag_position(self, input: dict) -> dict:
+        """Flag a position for senior close review."""
+        position_id = input["position_id"]
+        concern = input["concern"]
+
+        ctx = self._position_context.get(position_id, {})
+        if not ctx:
+            return {"error": f"Position {position_id} not found in review context"}
+
+        self._pending_close_reviews.append({
+            "position_id": position_id,
+            "concern": concern,
+            **ctx,
+        })
+
+        logger.info(f"Position {position_id} flagged for close review: {concern[:100]}")
+        return {
+            "status": "flagged",
+            "message": (
+                "Position flagged for senior review. A senior model will evaluate "
+                "your concern and decide whether to close. No further action needed."
+            ),
         }
