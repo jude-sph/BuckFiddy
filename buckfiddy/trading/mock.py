@@ -34,6 +34,8 @@ class MockTradingBackend:
         self._repair_balance(settings.STARTING_BALANCE)
         # Cache: token_id -> {market_id, outcome, market_question}
         self._token_meta: dict[str, dict] = {}
+        # Cache: token_id -> last successfully fetched midpoint
+        self._price_cache: dict[str, float] = {}
 
     def _ensure_wallet(self, starting_balance: float):
         row = self.store.fetchone("SELECT balance FROM wallet WHERE id = 1")
@@ -80,19 +82,27 @@ class MockTradingBackend:
         return datetime.now(timezone.utc).isoformat()
 
     def _fetch_midpoint(self, token_id: str) -> float:
-        """Fetch the live midpoint price from the CLOB API."""
-        resp = requests.get(f"{CLOB_API}/midpoint", params={"token_id": token_id})
+        """Fetch the live midpoint price from the CLOB API.
+
+        Caches successful results so we can return the last known price
+        when the API is temporarily unreachable.
+        """
+        resp = requests.get(
+            f"{CLOB_API}/midpoint", params={"token_id": token_id}, timeout=10
+        )
         resp.raise_for_status()
         data = resp.json()
         mid = float(data.get("mid", 0))
         if mid <= 0:
             raise ValueError(f"Invalid midpoint for token {token_id}: {data}")
+        self._price_cache[token_id] = mid
         return mid
 
     def _fetch_price(self, token_id: str, side: str) -> float:
         """Fetch the best bid or ask from the CLOB API."""
         resp = requests.get(
-            f"{CLOB_API}/price", params={"token_id": token_id, "side": side}
+            f"{CLOB_API}/price", params={"token_id": token_id, "side": side},
+            timeout=10,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -139,11 +149,18 @@ class MockTradingBackend:
 
         for row in pos_rows:
             try:
-                mid = self._fetch_midpoint(row["token_id"])
+                # Use best bid (what we'd actually get if we sold now)
+                bid = self._fetch_price(row["token_id"], "sell")
+                if bid > 0:
+                    self._price_cache[row["token_id"]] = bid
+                else:
+                    bid = self._fetch_midpoint(row["token_id"])
             except Exception:
-                mid = row["avg_entry_price"]  # Fallback if API fails
+                bid = self._price_cache.get(
+                    row["token_id"], row["avg_entry_price"]
+                )
 
-            current_value = row["size"] * mid
+            current_value = row["size"] * bid
             entry_value = row["size"] * row["avg_entry_price"]
             unrealized_pnl = current_value - entry_value
             unrealized_pnl_pct = unrealized_pnl / entry_value if entry_value > 0 else 0

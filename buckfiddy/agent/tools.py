@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from buckfiddy.config import Settings
 from buckfiddy.markets.scanner import MarketScanner
+from buckfiddy.risk.sizing import calculate_position_size
 from buckfiddy.state.store import StateStore
 from buckfiddy.trading.models import MarketPrice
 
@@ -486,12 +487,14 @@ class ToolDispatcher:
             None,
         )
 
-        # Calculate suggested position size
-        suggested_pct = min(
-            0.05 + (abs_edge - self.settings.EDGE_THRESHOLD) * 0.5,
-            self.settings.MAX_POSITION_PCT,
+        # Calculate suggested position size using Kelly criterion
+        suggested_amount = calculate_position_size(
+            balance=balance,
+            edge=edge,
+            market_price=midpoint,
+            max_position_pct=self.settings.MAX_POSITION_PCT,
+            kelly_fraction=self.settings.KELLY_FRACTION,
         ) if tradeable else 0
-        suggested_amount = round(balance * suggested_pct, 2)
 
         if held_position and tradeable and edge < 0:
             # Claude holds this outcome but now thinks it's OVERVALUED

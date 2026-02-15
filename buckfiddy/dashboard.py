@@ -96,75 +96,69 @@ _live_state_lock = threading.Lock()
 _price_updater_started = False
 
 
-_slugs_backfilled = False
+_slug_cache: dict[str, str] = {}  # market_id -> slug (in-memory, populated lazily)
+_BAD_SLUG = "will-joe-biden-get-coronavirus-before-the-election"
 
 
-def _backfill_slugs():
-    """One-time: fetch slugs from Gamma API for positions/estimates missing them."""
-    global _slugs_backfilled
-    if _slugs_backfilled:
-        return
+def _resolve_slug(market_id: str, token_id: str = "") -> str:
+    """Look up the Polymarket slug for a market, with caching.
 
-    try:
-        import requests as _req
-        s = get_store()
-        # Collect market_ids with missing slugs
-        missing_pos = s.fetchall(
-            "SELECT DISTINCT market_id FROM positions WHERE (slug IS NULL OR slug = '') AND size > 0"
+    Uses token_id (clob_token_ids) for the Gamma API query since the
+    conditionId parameter is unreliable.
+    """
+    if not market_id:
+        return ""
+    if market_id in _slug_cache:
+        return _slug_cache[market_id]
+    # Try DB first (skip known-bad slugs from earlier buggy lookups)
+    s = get_store()
+    row = s.fetchone(
+        "SELECT slug FROM estimates WHERE market_id = ? AND slug != '' AND slug != ? LIMIT 1",
+        (market_id, _BAD_SLUG),
+    )
+    if not row:
+        row = s.fetchone(
+            "SELECT slug FROM positions WHERE market_id = ? AND slug != '' AND slug != ? LIMIT 1",
+            (market_id, _BAD_SLUG),
         )
-        missing_est = s.fetchall(
-            "SELECT DISTINCT market_id FROM estimates WHERE slug IS NULL OR slug = ''"
-        )
-        market_ids = {r["market_id"] for r in missing_pos} | {r["market_id"] for r in missing_est}
-        if not market_ids:
-            return
-
-        # Fetch from Gamma API in one batch (filter by conditionIds)
-        slug_map = {}
-        for mid in market_ids:
-            try:
-                resp = _req.get(
-                    "https://gamma-api.polymarket.com/markets",
-                    params={"conditionId": mid, "limit": 1},
-                    timeout=10,
-                )
-                if resp.ok:
-                    data = resp.json()
-                    if data and isinstance(data, list) and data[0].get("slug"):
-                        slug_map[mid] = data[0]["slug"]
-            except Exception:
-                pass
-
-        if not slug_map:
-            return
-
-        # Update DB
-        for mid, slug in slug_map.items():
-            s.execute("UPDATE positions SET slug = ? WHERE market_id = ? AND (slug IS NULL OR slug = '')", (slug, mid))
-            s.execute("UPDATE estimates SET slug = ? WHERE market_id = ? AND (slug IS NULL OR slug = '')", (slug, mid))
-        s.commit()
-
-        # Update token_meta cache on the backend
-        a = get_or_create_agent()
-        if hasattr(a.backend, '_token_meta'):
-            for tid, meta in a.backend._token_meta.items():
-                mid = meta.get("market_id", "")
-                if mid in slug_map and not meta.get("slug"):
-                    meta["slug"] = slug_map[mid]
-
-        _slugs_backfilled = True
-        log = logging.getLogger("buckfiddy.slug_backfill")
-        log.info(f"Backfilled slugs for {len(slug_map)} markets")
-    except Exception as e:
-        _slugs_backfilled = True  # Don't retry on error — will be filled by next scan
-        logging.getLogger("buckfiddy.slug_backfill").warning(f"Slug backfill failed: {e}")
+    if row and row["slug"]:
+        _slug_cache[market_id] = row["slug"]
+        return row["slug"]
+    # Fetch from Gamma API using clob_token_ids (conditionId is unreliable)
+    if token_id:
+        try:
+            import requests as _req
+            resp = _req.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={"clob_token_ids": token_id, "limit": 1},
+                timeout=5,
+            )
+            if resp.ok:
+                data = resp.json()
+                if data and isinstance(data, list) and data[0].get("slug"):
+                    slug = data[0]["slug"]
+                    _slug_cache[market_id] = slug
+                    # Persist to DB for future sessions (also fix bad slugs)
+                    s.execute(
+                        "UPDATE positions SET slug = ? WHERE market_id = ?",
+                        (slug, market_id),
+                    )
+                    s.execute(
+                        "UPDATE estimates SET slug = ? WHERE market_id = ?",
+                        (slug, market_id),
+                    )
+                    s.commit()
+                    return slug
+        except Exception:
+            pass
+    _slug_cache[market_id] = ""  # Cache empty to avoid retrying
+    return ""
 
 
 def _price_update_loop():
     """Background thread: fetch live prices for open positions every 30s."""
     while True:
         try:
-            _backfill_slugs()
             a = get_or_create_agent()
             wallet = a.backend.get_wallet_state()
             with _live_state_lock:
@@ -184,8 +178,7 @@ def _price_update_loop():
                         "current_value": p.current_value,
                         "unrealized_pnl": p.unrealized_pnl,
                         "unrealized_pnl_pct": p.unrealized_pnl_pct,
-                        "slug": (a.backend._get_token_meta(p.token_id).get("slug", "")
-                                 if hasattr(a.backend, '_get_token_meta') else ""),
+                        "slug": _resolve_slug(p.market_id, p.token_id),
                     }
                     for p in wallet.positions
                 ]
@@ -332,7 +325,7 @@ def api_positions():
             "current_value": round(r["size"] * r["avg_entry_price"], 4),
             "unrealized_pnl": 0,
             "unrealized_pnl_pct": 0,
-            "slug": r["slug"] if "slug" in r.keys() else "",
+            "slug": _resolve_slug(r["market_id"], r["token_id"]),
         }
         for r in rows
     ]
@@ -343,8 +336,7 @@ def api_trades():
     s = get_store()
     rows = s.fetchall(
         "SELECT t.*, e.claude_estimate, e.market_midpoint, e.edge, "
-        "e.reasoning AS estimate_reasoning, e.market_question AS est_market_question, "
-        "e.slug AS est_slug "
+        "e.reasoning AS estimate_reasoning, e.market_question AS est_market_question "
         "FROM trades t LEFT JOIN estimates e ON t.estimate_id = e.id "
         "ORDER BY t.executed_at DESC LIMIT 50"
     )
@@ -355,13 +347,12 @@ def api_trades():
         claude_estimate = r["claude_estimate"]
         market_midpoint = r["market_midpoint"]
         edge = r["edge"]
-        slug = r["est_slug"] if "est_slug" in r.keys() else ""
 
         # For SELL trades without a linked estimate (e.g. risk guard closures),
         # find the most recent estimate for this market to show reasoning
         if not reasoning and r["side"] == "SELL":
             fallback = s.fetchone(
-                "SELECT claude_estimate, market_midpoint, edge, reasoning, market_question, slug "
+                "SELECT claude_estimate, market_midpoint, edge, reasoning, market_question "
                 "FROM estimates WHERE market_id = ? ORDER BY id DESC LIMIT 1",
                 (r["market_id"],),
             )
@@ -371,7 +362,6 @@ def api_trades():
                 claude_estimate = claude_estimate or fallback["claude_estimate"]
                 market_midpoint = market_midpoint or fallback["market_midpoint"]
                 edge = edge or fallback["edge"]
-                slug = slug or (fallback["slug"] if "slug" in fallback.keys() else "")
 
         # Compute percent PnL from entry_price
         pnl = r["pnl"]
@@ -398,7 +388,7 @@ def api_trades():
             "edge": edge,
             "reasoning": reasoning,
             "market_question": market_question,
-            "slug": slug or "",
+            "slug": _resolve_slug(r["market_id"], r["token_id"]),
             "executed_at": r["executed_at"],
         })
     return result
@@ -415,7 +405,7 @@ def api_estimates():
             "id": r["id"],
             "market_id": r["market_id"],
             "market_question": r["market_question"] if "market_question" in r.keys() else "",
-            "slug": r["slug"] if "slug" in r.keys() else "",
+            "slug": _resolve_slug(r["market_id"], r["token_id"]),
             "outcome": r["outcome"],
             "claude_estimate": r["claude_estimate"],
             "market_midpoint": r["market_midpoint"],
@@ -503,6 +493,7 @@ def api_agent_status():
         "market_cooldown": (a.settings.MARKET_COOLDOWN_SECONDS if a else settings.MARKET_COOLDOWN_SECONDS) // 60,
         "stop_loss_pct": a.settings.STOP_LOSS_PCT if a else settings.STOP_LOSS_PCT,
         "take_profit_pct": a.settings.TAKE_PROFIT_PCT if a else settings.TAKE_PROFIT_PCT,
+        "kelly_fraction": a.settings.KELLY_FRACTION if a else settings.KELLY_FRACTION,
         "max_cycle_cost": a.settings.MAX_CYCLE_COST_USD if a else settings.MAX_CYCLE_COST_USD,
         "next_check_secs": a.next_check_secs if a else 0,
         "next_research_secs": a.next_research_secs if a else 0,
@@ -605,6 +596,7 @@ def api_timing_update(body: dict):
     cooldown = body.get("market_cooldown")
     stop_loss = body.get("stop_loss")
     take_profit = body.get("take_profit")
+    kelly = body.get("kelly_fraction")
     cost_cap = body.get("max_cycle_cost")
 
     a = get_or_create_agent()
@@ -629,6 +621,9 @@ def api_timing_update(body: dict):
     if take_profit is not None:
         val = max(0.10, min(0.90, float(take_profit)))  # 10-90%
         a.settings.TAKE_PROFIT_PCT = val
+    if kelly is not None:
+        val = max(0.10, min(1.0, float(kelly)))  # 10-100%
+        a.settings.KELLY_FRACTION = val
     if cost_cap is not None:
         val = max(0.10, min(10.0, float(cost_cap)))  # $0.10-$10.00
         a.settings.MAX_CYCLE_COST_USD = val
@@ -642,6 +637,7 @@ def api_timing_update(body: dict):
         "market_cooldown": a.settings.MARKET_COOLDOWN_SECONDS // 60,
         "stop_loss": a.settings.STOP_LOSS_PCT,
         "take_profit": a.settings.TAKE_PROFIT_PCT,
+        "kelly_fraction": a.settings.KELLY_FRACTION,
         "max_cycle_cost": a.settings.MAX_CYCLE_COST_USD,
     }
 
@@ -690,46 +686,6 @@ def api_agent_single():
         agent_thread.start()
     return {"status": "started_single"}
 
-
-@app.post("/api/slugs/resolve")
-def api_slugs_resolve(body: dict):
-    """Resolve market_ids to Polymarket slugs via the Gamma API (server-side proxy)."""
-    import requests as _req
-    market_ids = body.get("market_ids", [])
-    if not market_ids:
-        return {"slugs": {}}
-
-    s = get_store()
-    slug_map = {}
-    for mid in market_ids[:20]:  # Cap at 20 to avoid abuse
-        try:
-            resp = _req.get(
-                "https://gamma-api.polymarket.com/markets",
-                params={"conditionId": mid, "limit": 1},
-                timeout=5,
-            )
-            if resp.ok:
-                data = resp.json()
-                if data and isinstance(data, list) and data[0].get("slug"):
-                    slug_map[mid] = data[0]["slug"]
-        except Exception:
-            pass
-
-    # Persist resolved slugs to DB
-    if slug_map:
-        for mid, slug in slug_map.items():
-            s.execute("UPDATE positions SET slug = ? WHERE market_id = ? AND (slug IS NULL OR slug = '')", (slug, mid))
-            s.execute("UPDATE estimates SET slug = ? WHERE market_id = ? AND (slug IS NULL OR slug = '')", (slug, mid))
-        s.commit()
-        # Update in-memory token_meta
-        a = get_or_create_agent()
-        if hasattr(a.backend, '_token_meta'):
-            for meta in a.backend._token_meta.values():
-                mid = meta.get("market_id", "")
-                if mid in slug_map and not meta.get("slug"):
-                    meta["slug"] = slug_map[mid]
-
-    return {"slugs": slug_map}
 
 
 @app.post("/api/position/close")
@@ -874,9 +830,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="flex items-center gap-1"><span class="text-slate-500">Min edge</span>
             <input id="timing-edge" type="number" min="1" max="50" step="1" class="w-10 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateSettings()">
             <span class="text-slate-600">%</span></div>
-          <div class="flex items-center gap-1"><span class="text-slate-500">Market research cooldown</span>
+          <div class="flex items-center gap-1"><span class="text-slate-500">Cooldown</span>
             <input id="timing-cooldown" type="number" min="0" max="1440" step="30" class="w-14 px-1 py-0.5 text-xs font-mono text-slate-300 bg-slate-800 border border-slate-700 rounded text-center" onchange="updateSettings()">
             <span class="text-slate-600">min</span></div>
+          <div class="flex items-center gap-1"><span class="text-slate-500">Aggression</span>
+            <input id="setting-kelly" type="range" min="10" max="100" step="5" class="w-20 h-1 accent-blue-500" oninput="$('kelly-label').textContent = this.value + '%'" onchange="updateSettings()">
+            <span id="kelly-label" class="text-slate-400 text-xs font-mono w-8">50%</span></div>
         </div>
         <div class="flex items-center gap-4">
           <span class="w-14 text-slate-500 font-medium shrink-0">Risk</span>
@@ -1017,11 +976,10 @@ function saveCostLimit() {
   if (el) el.value = saved;
 })();
 
-function marketLink(question) {
+function marketLink(question, slug) {
   const text = (question || '').replace(/</g, '&lt;');
-  if (!question) return text;
-  const q = encodeURIComponent('site:polymarket.com ' + question);
-  return '<a href="https://www.google.com/search?q=' + q + '" target="_blank" rel="noopener" class="text-blue-400 hover:text-blue-300 hover:underline transition-colors" onclick="event.stopPropagation()">' + text + ' <span class="text-blue-600 text-[10px]">&#8599;</span></a>';
+  if (!slug) return text;
+  return '<a href="https://polymarket.com/event/' + slug + '" target="_blank" rel="noopener" class="text-blue-400 hover:text-blue-300 hover:underline transition-colors" onclick="event.stopPropagation()">' + text + ' <span class="text-blue-600 text-[10px]">&#8599;</span></a>';
 }
 function fmtUsd(v) { return '$' + Number(v).toFixed(2); }
 function fmtPct(v) { return (v >= 0 ? '+' : '') + Number(v).toFixed(1) + '%'; }
@@ -1207,6 +1165,10 @@ async function updateAgentStatus() {
   if (d.take_profit_pct != null && !$('setting-takeprofit').matches(':focus')) {
     $('setting-takeprofit').value = Math.round(d.take_profit_pct * 100);
   }
+  if (d.kelly_fraction != null && !$('setting-kelly').matches(':active')) {
+    $('setting-kelly').value = Math.round(d.kelly_fraction * 100);
+    $('kelly-label').textContent = Math.round(d.kelly_fraction * 100) + '%';
+  }
   if (d.max_cycle_cost != null && !$('setting-costcap').matches(':focus')) {
     $('setting-costcap').value = d.max_cycle_cost;
   }
@@ -1343,7 +1305,7 @@ async function updatePositions() {
       const id = p.position_id;
       const expanded = expandedPositions.has(id);
       return `<tr class="border-t border-slate-800 cursor-pointer hover:bg-slate-800/30" onclick="togglePosition('${id}')">
-      <td class="py-2 pr-3 max-w-[200px] truncate" title="${(p.market_question || '').replace(/"/g, '&quot;')}">${marketLink(p.market_question)}</td>
+      <td class="py-2 pr-3 max-w-[200px] truncate" title="${(p.market_question || '').replace(/"/g, '&quot;')}">${marketLink(p.market_question, p.slug)}</td>
       <td><span class="px-2 py-0.5 rounded text-xs font-medium badge-yes">${p.outcome}</span></td>
       <td class="text-right font-mono">${p.size.toFixed(1)}</td>
       <td class="text-right font-mono">${(p.avg_entry_price * 100).toFixed(1)}%</td>
@@ -1388,7 +1350,7 @@ async function updateTrades() {
       const expanded = expandedTrades.has(id);
       return `<tr class="border-t border-slate-800 ${t.reasoning ? 'cursor-pointer' : ''}" ${t.reasoning ? 'onclick="toggleTrade(\\''+id+'\\')"' : ''}>
       <td class="py-2 text-slate-400">${fmtTime(t.executed_at)}</td>
-      <td class="max-w-[250px] truncate" title="${(t.market_question || '').replace(/"/g, '&quot;')}">${marketLink(t.market_question || t.outcome)}</td>
+      <td class="max-w-[250px] truncate" title="${(t.market_question || '').replace(/"/g, '&quot;')}">${marketLink(t.market_question || t.outcome, t.slug)}</td>
       <td><span class="px-2 py-0.5 rounded text-xs font-medium ${t.side === 'BUY' ? 'badge-buy' : 'badge-sell'}">${t.side} ${t.outcome}</span></td>
       <td class="text-right font-mono">$${t.price.toFixed(3)}</td>
       <td class="text-right font-mono">${t.entry_price ? '$' + (t.entry_price * t.size).toFixed(2) : t.size.toFixed(1)}</td>
@@ -1419,7 +1381,7 @@ async function updateEstimatesTable() {
       const expanded = expandedEstimates.has(id);
       return `<tr class="border-t border-slate-800 cursor-pointer" onclick="toggleEstimate('${id}')">
       <td class="py-2 text-slate-400">${fmtTime(e.created_at)}</td>
-      <td class="max-w-[350px] truncate" title="${(e.market_question || '').replace(/"/g, '&quot;')}">${e.market_question ? marketLink(e.market_question) : '<span class=\\'text-slate-600\\'>—</span>'}</td>
+      <td class="max-w-[350px] truncate" title="${(e.market_question || '').replace(/"/g, '&quot;')}">${e.market_question ? marketLink(e.market_question, e.slug) : '<span class=\\'text-slate-600\\'>—</span>'}</td>
       <td><span class="px-2 py-0.5 rounded text-xs font-medium badge-yes">${e.outcome}</span></td>
       <td class="text-right font-mono">${(e.claude_estimate * 100).toFixed(1)}%</td>
       <td class="text-right font-mono">${(e.market_midpoint * 100).toFixed(1)}%</td>
@@ -1490,6 +1452,7 @@ async function updateSettings() {
   const cooldownMin = parseInt($('timing-cooldown').value) || 0;
   const stopLoss = parseInt($('setting-stoploss').value) || 50;
   const takeProfit = parseInt($('setting-takeprofit').value) || 40;
+  const kelly = parseInt($('setting-kelly').value) || 50;
   const costCap = parseFloat($('setting-costcap').value) || 1.00;
   await fetch('/api/timing/update', {
     method: 'POST',
@@ -1502,6 +1465,7 @@ async function updateSettings() {
       market_cooldown: cooldownMin * 60,
       stop_loss: stopLoss / 100,
       take_profit: takeProfit / 100,
+      kelly_fraction: kelly / 100,
       max_cycle_cost: costCap
     })
   });

@@ -55,6 +55,8 @@ class RealTradingBackend:
 
         # Token metadata cache
         self._token_meta: dict[str, dict] = {}
+        # Cache: token_id -> last successfully fetched price
+        self._price_cache: dict[str, float] = {}
 
         # Circuit breaker: shuts down after too many consecutive failures
         self._consecutive_failures = 0
@@ -200,10 +202,21 @@ class RealTradingBackend:
                     continue
 
                 avg_price = float(raw.get("avgPrice", 0))
-                mid = float(self._retry_read(
-                    self.client.get_midpoint, token_id
-                ))
-                current_value = size * mid
+                # Use best bid (what we'd actually get if we sold now)
+                try:
+                    bid = float(self._retry_read(
+                        self.client.get_price, token_id, "sell"
+                    ))
+                    if bid > 0:
+                        self._price_cache[token_id] = bid
+                    else:
+                        bid = float(self._retry_read(
+                            self.client.get_midpoint, token_id
+                        ))
+                        self._price_cache[token_id] = bid
+                except Exception:
+                    bid = self._price_cache.get(token_id, avg_price)
+                current_value = size * bid
                 entry_value = size * avg_price
                 pnl = current_value - entry_value
                 pnl_pct = pnl / entry_value if entry_value > 0 else 0
@@ -268,6 +281,7 @@ class RealTradingBackend:
 
     def get_market_price(self, token_id: str) -> MarketPrice:
         mid = float(self._retry_read(self.client.get_midpoint, token_id))
+        self._price_cache[token_id] = mid
         bid = float(self._retry_read(self.client.get_price, token_id, "sell"))
         ask = float(self._retry_read(self.client.get_price, token_id, "buy"))
         meta = self._get_token_meta(token_id)
@@ -275,8 +289,8 @@ class RealTradingBackend:
         return MarketPrice(
             token_id=token_id,
             outcome=meta["outcome"],
-            best_bid=bid,
-            best_ask=ask,
+            best_bid=bid or mid * 0.99,
+            best_ask=ask or mid * 1.01,
             midpoint=mid,
         )
 

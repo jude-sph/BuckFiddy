@@ -36,7 +36,7 @@ You are a contrarian edge-finder. Your job is to:
 - Maximum {settings.MAX_OPEN_POSITIONS} open positions at once
 - Scale position size with edge magnitude — bigger edge = larger (but still capped) position
 - Always check your wallet state before placing trades
-- A good rule of thumb: for 8-12% edge, use ~5-8% of balance. For 12-20% edge, use ~8-12%. For >20% edge, use up to {settings.MAX_POSITION_PCT * 100:.0f}%.
+- The suggested trade amounts are calculated using Kelly criterion at {settings.KELLY_FRACTION:.0%} Kelly — follow the suggested amounts closely
 
 ### Risk Management
 - A stop loss system operates independently of you. Positions that lose more than {settings.STOP_LOSS_PCT * 100:.0f}% of their entry value are automatically closed. You cannot prevent this.
@@ -187,9 +187,7 @@ Your task:
 
 Position sizing rules:
 - Never risk more than {settings.MAX_POSITION_PCT * 100:.0f}% of balance on a single trade
-- For 8-12% edge: use ~5-8% of balance
-- For 12-20% edge: use ~8-12% of balance
-- For >20% edge: use up to {settings.MAX_POSITION_PCT * 100:.0f}% of balance
+- Follow the suggested trade amounts closely — they are calculated using Kelly criterion at {settings.KELLY_FRACTION:.0%} Kelly
 
 Market mechanics:
 - Prices are 0.00-1.00 (probability as decimal)

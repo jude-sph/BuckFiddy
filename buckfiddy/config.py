@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     # Agent behavior — trading
     EDGE_THRESHOLD: float = 0.08
     MAX_POSITION_PCT: float = 0.15
+    KELLY_FRACTION: float = 0.5  # 0.25=conservative, 0.5=moderate, 1.0=aggressive
     MAX_OPEN_POSITIONS: int = 10
     MAX_NEW_ESTIMATES_PER_CYCLE: int = 2  # Hard limit on new market estimates per cycle
     STOP_LOSS_PCT: float = 0.50
