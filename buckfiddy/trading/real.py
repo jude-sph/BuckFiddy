@@ -158,6 +158,22 @@ class RealTradingBackend:
         resp.raise_for_status()
         return resp.json()
 
+    # ── Response parsing helpers ────────────────────────────────
+
+    @staticmethod
+    def _parse_midpoint(resp) -> float:
+        """Extract midpoint from get_midpoint response (may be dict or str)."""
+        if isinstance(resp, dict):
+            return float(resp.get("mid", resp.get("midpoint", 0)))
+        return float(resp)
+
+    @staticmethod
+    def _parse_price(resp) -> float:
+        """Extract price from get_price response (may be dict or str)."""
+        if isinstance(resp, dict):
+            return float(resp.get("price", 0))
+        return float(resp)
+
     # ── Token metadata ──────────────────────────────────────────
 
     def register_token_meta(
@@ -204,13 +220,13 @@ class RealTradingBackend:
                 avg_price = float(raw.get("avgPrice", 0))
                 # Use best bid (what we'd actually get if we sold now)
                 try:
-                    bid = float(self._retry_read(
+                    bid = self._parse_price(self._retry_read(
                         self.client.get_price, token_id, "sell"
                     ))
                     if bid > 0:
                         self._price_cache[token_id] = bid
                     else:
-                        bid = float(self._retry_read(
+                        bid = self._parse_midpoint(self._retry_read(
                             self.client.get_midpoint, token_id
                         ))
                         self._price_cache[token_id] = bid
@@ -264,11 +280,22 @@ class RealTradingBackend:
         except Exception as e:
             logger.error(f"Failed to fetch open orders: {e}")
 
-        # Get balance from allowance
+        # Get USDC balance
         try:
-            allowance = self._retry_read(self.client.get_balance_allowance)
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL,
+                signature_type=self.settings.POLYMARKET_SIGNATURE_TYPE,
+            )
+            # Sync balance from chain first, then read it
+            try:
+                self._retry_read(self.client.update_balance_allowance, params)
+            except Exception:
+                pass  # update may fail; still try reading
+            allowance = self._retry_read(self.client.get_balance_allowance, params)
             balance = float(allowance.get("balance", 0)) / 1e6  # USDC has 6 decimals
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Balance fetch failed: {e}")
             balance = 0.0
 
         return WalletState(
@@ -280,10 +307,10 @@ class RealTradingBackend:
         )
 
     def get_market_price(self, token_id: str) -> MarketPrice:
-        mid = float(self._retry_read(self.client.get_midpoint, token_id))
+        mid = self._parse_midpoint(self._retry_read(self.client.get_midpoint, token_id))
         self._price_cache[token_id] = mid
-        bid = float(self._retry_read(self.client.get_price, token_id, "sell"))
-        ask = float(self._retry_read(self.client.get_price, token_id, "buy"))
+        bid = self._parse_price(self._retry_read(self.client.get_price, token_id, "sell"))
+        ask = self._parse_price(self._retry_read(self.client.get_price, token_id, "buy"))
         meta = self._get_token_meta(token_id)
 
         return MarketPrice(
@@ -348,7 +375,7 @@ class RealTradingBackend:
             # FOK orders fill at order book prices, but midpoint is a
             # reasonable approximation and always available.
             try:
-                pre_mid = float(self.client.get_midpoint(token_id))
+                pre_mid = self._parse_midpoint(self.client.get_midpoint(token_id))
             except Exception:
                 pre_mid = None
 

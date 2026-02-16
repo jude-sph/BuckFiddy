@@ -213,6 +213,15 @@ class AgentLoop:
         self.current_phase = "Starting"
         logger.info(f"=== Cycle {self.cycle_count} ({self.current_cycle_type}) starting ===")
 
+        # Skip check cycles entirely if no open positions (saves API costs)
+        if not is_full:
+            wallet = self.backend.get_wallet_state()
+            if not wallet.positions and not wallet.open_orders:
+                logger.info(f"Cycle {self.cycle_count} skipped — no open positions")
+                self.current_cycle_type = ""
+                self.current_phase = ""
+                return
+
         # Hard risk guards (outside Claude's control) — only on check cycles
         guard_results = []
         if not is_full:
@@ -931,7 +940,7 @@ class AgentLoop:
                 f"Equity: ${wallet.total_equity:.2f}, "
                 f"Positions: {len(wallet.positions)} | "
                 f"API: {usage.input_tokens}in/{usage.output_tokens}out "
-                f"${cost:.4f} (total: ${cumulative_cost:.4f})"
+                f"${usage.cost_usd:.4f} (total: ${cumulative_cost:.4f})"
             )
         except Exception as e:
             logger.error(f"Failed to log cycle: {e}")

@@ -1,5 +1,6 @@
 from typing import Literal
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -19,7 +20,7 @@ class Settings(BaseSettings):
     POLYMARKET_PRIVATE_KEY: str = ""
     POLYMARKET_CHAIN_ID: int = 137
     POLYMARKET_FUNDER_ADDRESS: str = ""
-    POLYMARKET_SIGNATURE_TYPE: int = 0  # 0=EOA
+    POLYMARKET_SIGNATURE_TYPE: int = 1  # 0=EOA, 1=POLY_PROXY
 
     # Agent behavior — cycle scheduling
     FULL_CYCLE_INTERVAL_SECONDS: int = 7200  # 2 hours between full scan+trade cycles
@@ -47,6 +48,12 @@ class Settings(BaseSettings):
     MAX_CYCLE_COST_USD: float = 1.00  # Abort cycle if Claude API cost exceeds this
 
     # Persistence
-    DB_PATH: str = "data/buckfiddy.db"
+    DB_PATH: str = ""  # Auto-set based on TRADING_BACKEND if empty
 
     model_config = {"env_file": ".env", "env_prefix": "BF_"}
+
+    @model_validator(mode="after")
+    def _set_db_path(self) -> "Settings":
+        if not self.DB_PATH:
+            self.DB_PATH = f"data/buckfiddy_{self.TRADING_BACKEND}.db"
+        return self

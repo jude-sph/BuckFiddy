@@ -65,6 +65,37 @@ def _prefill_log_buffer():
 _prefill_log_buffer()
 
 
+def _update_env(updates: dict[str, str]):
+    """Write key=value pairs to .env (create/update lines, prefix with BF_)."""
+    import os
+    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+    lines: list[str] = []
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            lines = f.readlines()
+
+    remaining = dict(updates)  # keys still to write
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        matched = False
+        for key in list(remaining):
+            env_key = f"BF_{key}"
+            if stripped.startswith(f"{env_key}=") or stripped.startswith(f"# {env_key}="):
+                new_lines.append(f"{env_key}={remaining.pop(key)}\n")
+                matched = True
+                break
+        if not matched:
+            new_lines.append(line)
+
+    # Append any keys not found in existing file
+    for key, val in remaining.items():
+        new_lines.append(f"BF_{key}={val}\n")
+
+    with open(env_path, "w") as f:
+        f.writelines(new_lines)
+
+
 def get_store() -> StateStore:
     global store
     if store is None:
@@ -156,7 +187,11 @@ def _resolve_slug(market_id: str, token_id: str = "") -> str:
 
 
 def _price_update_loop():
-    """Background thread: fetch live prices for open positions every 30s."""
+    """Background thread: fetch live prices and enforce risk guards every 30s."""
+    from buckfiddy.risk.stoploss import check_risk_guards
+
+    _guard_logger = logging.getLogger("buckfiddy.risk_guard")
+
     while True:
         try:
             a = get_or_create_agent()
@@ -182,6 +217,19 @@ def _price_update_loop():
                     }
                     for p in wallet.positions
                 ]
+
+            # Enforce stop-loss / take-profit continuously (every 30s)
+            if wallet.positions:
+                try:
+                    results = check_risk_guards(
+                        a.backend,
+                        a.settings.STOP_LOSS_PCT,
+                        a.settings.TAKE_PROFIT_PCT,
+                    )
+                    for gr in results:
+                        _guard_logger.warning(f"{gr.guard_type.upper()}: {gr.message}")
+                except Exception as e:
+                    _guard_logger.debug(f"Risk guard check failed: {e}")
         except Exception as e:
             logging.getLogger("buckfiddy.price_updater").debug(f"Price update failed: {e}")
         time.sleep(30)
@@ -219,10 +267,24 @@ def api_summary():
         total_value = cash
         num_pos = 0
 
-    # Starting balance: use config value (initial deposit), not first equity snapshot
-    # (first snapshot is taken AFTER cycle 1, which already includes API costs and market moves)
     a = get_or_create_agent()
-    starting = a.settings.STARTING_BALANCE
+
+    # Starting balance: stored per-backend in DB metadata.
+    # For mock: set from config on first use. For real: captured from live wallet on first use.
+    row = s.fetchone("SELECT value FROM metadata WHERE key = 'starting_balance'")
+    if row:
+        starting = float(row["value"])
+    else:
+        if a.settings.TRADING_BACKEND == "real":
+            # Capture actual Polymarket balance as the starting point
+            starting = total_value if total_value > 0 else cash
+        else:
+            starting = a.settings.STARTING_BALANCE
+        s.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('starting_balance', ?)",
+            (str(starting),),
+        )
+        s.commit()
 
     # Read live API cost from api_usage (updated mid-cycle)
     live_cost = s.fetchone(
@@ -460,17 +522,21 @@ def api_reset():
     if agent and agent.running:
         return JSONResponse({"error": "Stop the agent before resetting"}, status_code=400)
     s = get_store()
-    for table in ["estimates", "trades", "orders", "positions", "cycle_log", "api_usage", "equity_snapshots"]:
+    settings = Settings()
+    for table in ["estimates", "trades", "orders", "positions", "cycle_log", "api_usage", "equity_snapshots", "metadata"]:
         s.execute(f"DELETE FROM {table}")
-    s.execute("UPDATE wallet SET balance = 100.0 WHERE id = 1")
+    s.execute("UPDATE wallet SET balance = ? WHERE id = 1", (settings.STARTING_BALANCE,))
     s.execute("DELETE FROM sqlite_sequence")  # Reset autoincrement counters
     s.commit()
+    # Clear live state so dashboard picks up fresh data
+    with _live_state_lock:
+        _live_state.clear()
     # Reset agent cycle counter and cooldowns so next run starts fresh
     if agent:
         agent.cycle_count = 0
         agent.dispatcher.reset_cycle_counters()
         agent._recently_researched.clear()
-    return {"status": "ok", "message": "All data cleared, balance reset to $100"}
+    return {"status": "ok", "message": "All data cleared"}
 
 
 @app.get("/api/agent/status")
@@ -510,30 +576,21 @@ def api_backend_switch(body: dict):
     if agent and agent.running:
         return JSONResponse({"error": "Stop the agent before switching backends"}, status_code=400)
 
-    # Update the .env file
-    import os
-    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
-    if os.path.exists(env_path):
-        with open(env_path) as f:
-            lines = f.readlines()
-        found = False
-        new_lines = []
-        for line in lines:
-            if line.strip().startswith("BF_TRADING_BACKEND"):
-                new_lines.append(f"BF_TRADING_BACKEND={target}\n")
-                found = True
-            else:
-                new_lines.append(line)
-        if not found:
-            new_lines.append(f"BF_TRADING_BACKEND={target}\n")
-        with open(env_path, "w") as f:
-            f.writelines(new_lines)
+    _update_env({"TRADING_BACKEND": target})
 
     # Force recreate agent on next start
     agent = None
     agent_thread = None
 
+    # Clear cached state from previous backend
+    global store
+    store = None  # Force new DB connection for new backend
+    with _live_state_lock:
+        _live_state.clear()
+    _slug_cache.clear()
+
     # Clear settings cache by reloading
+    import os
     os.environ["BF_TRADING_BACKEND"] = target
 
     return {"status": "ok", "backend": target}
@@ -575,10 +632,15 @@ def api_models_switch(body: dict):
 
     # Update the agent's settings in memory
     a = get_or_create_agent()
+    env_updates = {}
     if fast:
         a.settings.CLAUDE_MODEL_FAST = fast
+        env_updates["CLAUDE_MODEL_FAST"] = fast
     if research:
         a.settings.CLAUDE_MODEL_RESEARCH = research
+        env_updates["CLAUDE_MODEL_RESEARCH"] = research
+    if env_updates:
+        _update_env(env_updates)
 
     return {
         "status": "ok",
@@ -627,6 +689,19 @@ def api_timing_update(body: dict):
     if cost_cap is not None:
         val = max(0.10, min(10.0, float(cost_cap)))  # $0.10-$10.00
         a.settings.MAX_CYCLE_COST_USD = val
+
+    # Persist to .env so changes survive restarts
+    _update_env({
+        "FULL_CYCLE_INTERVAL_SECONDS": str(a.settings.FULL_CYCLE_INTERVAL_SECONDS),
+        "POSITION_CHECK_INTERVAL_SECONDS": str(a.settings.POSITION_CHECK_INTERVAL_SECONDS),
+        "MAX_NEW_ESTIMATES_PER_CYCLE": str(a.settings.MAX_NEW_ESTIMATES_PER_CYCLE),
+        "EDGE_THRESHOLD": str(a.settings.EDGE_THRESHOLD),
+        "MARKET_COOLDOWN_SECONDS": str(a.settings.MARKET_COOLDOWN_SECONDS),
+        "STOP_LOSS_PCT": str(a.settings.STOP_LOSS_PCT),
+        "TAKE_PROFIT_PCT": str(a.settings.TAKE_PROFIT_PCT),
+        "KELLY_FRACTION": str(a.settings.KELLY_FRACTION),
+        "MAX_CYCLE_COST_USD": str(a.settings.MAX_CYCLE_COST_USD),
+    })
 
     return {
         "status": "ok",
@@ -1421,7 +1496,7 @@ async function switchBackend(target) {
     body: JSON.stringify({backend: target})
   });
   if (r.ok) {
-    updateAgentStatus();
+    refreshAll();
   } else {
     const d = await r.json();
     alert(d.error || 'Switch failed');
@@ -1516,7 +1591,7 @@ async function agentSingleCheck() {
 }
 
 async function resetData() {
-  if (!confirm('Reset all data? This clears all trades, positions, estimates, and resets balance to $100.')) return;
+  if (!confirm('Reset all data? This clears all trades, positions, estimates, and resets the starting balance.')) return;
   const r = await fetch('/api/reset', { method: 'POST' });
   if (r.ok) { refreshAll(); }
   else {
