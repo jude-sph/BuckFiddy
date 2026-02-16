@@ -49,9 +49,15 @@ class RealTradingBackend:
             funder=settings.POLYMARKET_FUNDER_ADDRESS,
         )
         # Create or derive L2 API credentials
-        api_creds = self.client.create_or_derive_api_creds()
-        self.client.set_api_creds(api_creds)
-        logger.info("Real trading backend initialized")
+        try:
+            api_creds = self.client.create_or_derive_api_creds()
+            self.client.set_api_creds(api_creds)
+            logger.info("Real trading backend initialized")
+        except Exception as e:
+            logger.error(
+                f"Failed to derive API credentials: {e}. "
+                f"Read-only operations (prices) will work, but trading will fail."
+            )
 
         # Token metadata cache
         self._token_meta: dict[str, dict] = {}
