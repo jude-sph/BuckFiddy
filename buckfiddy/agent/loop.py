@@ -964,7 +964,7 @@ class AgentLoop:
                 f"Equity: ${wallet.total_equity:.2f}, "
                 f"Positions: {len(wallet.positions)} | "
                 f"API: {usage.input_tokens}in/{usage.output_tokens}out "
-                f"${usage.cost_usd:.4f} (total: ${cumulative_cost:.4f})"
+                f"${usage.total_cost:.4f} (total: ${cumulative_cost:.4f})"
             )
         except Exception as e:
             logger.error(f"Failed to log cycle: {e}")
