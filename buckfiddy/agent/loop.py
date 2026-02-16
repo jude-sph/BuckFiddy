@@ -105,6 +105,30 @@ class AgentLoop:
         self._next_check_at: float = 0  # monotonic timestamp
         self._next_research_at: float = 0  # monotonic timestamp
         self._recently_researched: dict[str, float] = {}  # market_id → monotonic timestamp
+        self._load_recent_research()  # Restore cooldowns from DB
+
+    def _load_recent_research(self):
+        """Restore market cooldowns from the estimates table on startup."""
+        cooldown = self.settings.MARKET_COOLDOWN_SECONDS
+        now = datetime.now(timezone.utc)
+        rows = self.store.fetchall(
+            "SELECT DISTINCT market_id, MAX(created_at) as last_at "
+            "FROM estimates GROUP BY market_id"
+        )
+        mono_now = time.monotonic()
+        for row in rows:
+            try:
+                created = datetime.fromisoformat(row["last_at"])
+                age_secs = (now - created).total_seconds()
+                if age_secs < cooldown:
+                    # Convert wall-clock age to monotonic offset
+                    self._recently_researched[row["market_id"]] = mono_now - age_secs
+            except (ValueError, TypeError):
+                continue
+        if self._recently_researched:
+            logger.info(
+                f"Restored {len(self._recently_researched)} market cooldown(s) from DB"
+            )
 
     @property
     def next_check_secs(self) -> int:
