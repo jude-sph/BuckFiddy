@@ -196,6 +196,17 @@ class RealTradingBackend:
     # ── Read operations (with retry) ────────────────────────────
 
     def get_wallet_state(self) -> WalletState:
+        # If circuit breaker is open, return cached/empty state immediately
+        # to avoid log spam from multiple failed subsections
+        if self._circuit_open:
+            elapsed = time.monotonic() - self._circuit_opened_at
+            if elapsed < self._circuit_cooldown:
+                return WalletState(
+                    balance=0.0, total_position_value=0.0, total_equity=0.0,
+                    positions=[], open_orders=[],
+                )
+            # Cooldown expired — let it try again (auto-reset happens in _check_circuit)
+
         # Get positions from Data API
         try:
             raw_positions = self._retry_read(

@@ -187,14 +187,30 @@ def _resolve_slug(market_id: str, token_id: str = "") -> str:
 
 
 def _price_update_loop():
-    """Background thread: fetch live prices and enforce risk guards every 30s."""
+    """Background thread: fetch live prices and enforce risk guards every 30s.
+
+    Backs off exponentially (up to 5 min) when APIs are unreachable to avoid
+    log spam and wasted retries through the circuit breaker.
+    """
     from buckfiddy.risk.stoploss import check_risk_guards
 
+    _pu_logger = logging.getLogger("buckfiddy.price_updater")
     _guard_logger = logging.getLogger("buckfiddy.risk_guard")
+
+    consecutive_failures = 0
+    BASE_INTERVAL = 30
+    MAX_INTERVAL = 300  # 5 min max backoff
 
     while True:
         try:
             a = get_or_create_agent()
+
+            # Skip fetch if circuit breaker is open (avoids pointless timeouts)
+            if hasattr(a.backend, '_circuit_open') and a.backend._circuit_open:
+                _pu_logger.debug("Circuit breaker open, skipping price update")
+                time.sleep(MAX_INTERVAL)
+                continue
+
             wallet = a.backend.get_wallet_state()
             with _live_state_lock:
                 _live_state["cash"] = wallet.balance
@@ -218,7 +234,7 @@ def _price_update_loop():
                     for p in wallet.positions
                 ]
 
-            # Enforce stop-loss / take-profit continuously (every 30s)
+            # Enforce stop-loss / take-profit continuously
             if wallet.positions:
                 try:
                     results = check_risk_guards(
@@ -230,9 +246,18 @@ def _price_update_loop():
                         _guard_logger.warning(f"{gr.guard_type.upper()}: {gr.message}")
                 except Exception as e:
                     _guard_logger.debug(f"Risk guard check failed: {e}")
+
+            # Success — reset backoff
+            consecutive_failures = 0
+            time.sleep(BASE_INTERVAL)
         except Exception as e:
-            logging.getLogger("buckfiddy.price_updater").debug(f"Price update failed: {e}")
-        time.sleep(30)
+            consecutive_failures += 1
+            backoff = min(BASE_INTERVAL * (2 ** consecutive_failures), MAX_INTERVAL)
+            if consecutive_failures <= 2:
+                _pu_logger.warning(f"Price update failed: {e}")
+            else:
+                _pu_logger.debug(f"Price update failed (attempt {consecutive_failures}): {e}")
+            time.sleep(backoff)
 
 
 def _ensure_price_updater():
